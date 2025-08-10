@@ -8,10 +8,18 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
+// Updated CORS origins to include your subdomain
+const allowedOrigins = [
+  "http://localhost:3000", 
+  "http://localhost:19006", 
+  "https://chat.roc4.live",  // Your new subdomain
+  "https://roc4.live"        // Your main domain if needed
+];
+
 // Configure CORS for Socket.io
 const io = socketIo(server, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:19006", "https://your-frontend-domain.com"],
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -42,12 +50,18 @@ pool.connect()
 
 // Middleware
 app.use(cors({
-  origin: ["http://localhost:3000", "http://localhost:19006", "https://your-frontend-domain.com"],
+  origin: allowedOrigins,
   credentials: true
 }));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use('/uploads', express.static('uploads'));
+
+// Serve static files with proper headers for nginx caching
+app.use('/uploads', express.static('uploads', {
+  maxAge: '1d',
+  etag: true
+}));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -55,7 +69,8 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     service: 'Chat System API',
-    database: 'Connected'
+    database: 'Connected',
+    environment: process.env.NODE_ENV || 'development'
   });
 });
 
@@ -81,18 +96,23 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Handle 404
-/** 
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+// Handle 404 for API routes only
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API route not found' });
 });
-*/
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`🚀 Chat System Server running on port ${PORT}`);
+
+// Ensure the server runs on the correct interface
+const HOST = process.env.NODE_ENV === 'production' ? '127.0.0.1' : '0.0.0.0';
+
+server.listen(PORT, HOST, () => {
+  console.log(`🚀 Chat System Server running on ${HOST}:${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔗 Health check: http://${HOST}:${PORT}/health`);
+  if (process.env.NODE_ENV === 'production') {
+    console.log(`🌐 Public URL: https://chat.roc4.live`);
+  }
 });
 
 // Graceful shutdown
@@ -105,5 +125,18 @@ process.on('SIGINT', async () => {
     });
   });
 });
+
+// Handle uncaught exceptions in production
+if (process.env.NODE_ENV === 'production') {
+  process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    process.exit(1);
+  });
+  
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    process.exit(1);
+  });
+}
 
 module.exports = { app, server, pool };
