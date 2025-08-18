@@ -1,2 +1,14 @@
-#dependencies   
-/node_modules
+# Firebase
+config/firebase-service-account.json
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Logs
+logs/
+*.log
+
+# Node modules
+node_modules/
