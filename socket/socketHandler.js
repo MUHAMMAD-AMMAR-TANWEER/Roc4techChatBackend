@@ -1,5 +1,9 @@
 
+<<<<<<< HEAD
 // const { sendPushNotification } = require('../services/pushNotification');
+=======
+const { sendPushNotification } = require('../services/pushNotification');
+>>>>>>> 85ef287a5d84166fd32e14da0e5903553609ca3a
 
 module.exports = (io, pool) => {
   // Authentication middleware for socket
@@ -211,9 +215,37 @@ module.exports = (io, pool) => {
         for (const participant of participantsResult.rows) {
           if (!participant.is_online && participant.fcm_token) {
             try {
+<<<<<<< HEAD
               const notificationText = quotedMessageId 
                 ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
                 : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
+=======
+              const notificationTitle = `💬 ${socket.user.full_name || socket.user.username}`;
+              const notificationBody = quotedMessageId 
+                ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
+                : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
+              const result = await sendPushNotification(
+                                participant.fcm_token,
+                                notificationTitle,
+                                notificationBody,
+                                { 
+                                  roomId: String(roomId), 
+                                  messageId: String(message.id),
+                                  type: 'new_message',
+                                  senderName: socket.user.username,
+                                  senderId: String(socket.userId)
+                                }
+                                );
+
+                  if (result && result.shouldRemoveToken) {
+                                         await pool.query(
+                                            'UPDATE users SET fcm_token = NULL WHERE id = $1',
+                                                    [participant.id]
+                                                 );
+                                      console.log(`🗑️ Removed invalid FCM token for user ${participant.username}`);
+                                         }
+              
+>>>>>>> 85ef287a5d84166fd32e14da0e5903553609ca3a
                 /** 
               await sendPushNotification(
                 participant.fcm_token,
