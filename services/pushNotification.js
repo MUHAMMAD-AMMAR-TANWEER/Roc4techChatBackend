@@ -1,7 +1,13 @@
+// services/pushNotification.js
 const admin = require('firebase-admin');
+const path = require('path');
 
-// Initialize Firebase Admin (only if not already initialized)
-if (!admin.apps.length) {
+// Initialize Firebase Admin SDK
+let firebaseInitialized = false;
+
+function initializeFirebase() {
+  if (firebaseInitialized) return;
+  
   try {
     const serviceAccount = require('../config/firebase-service-account.json');
     
@@ -10,27 +16,33 @@ if (!admin.apps.length) {
       projectId: serviceAccount.project_id
     });
     
-    console.log('✅ Firebase Admin initialized successfully');
+    firebaseInitialized = true;
+    console.log('✅ Firebase Admin SDK initialized successfully');
   } catch (error) {
-    console.error('❌ Firebase Admin initialization failed:', error.message);
+    console.error('❌ Firebase initialization failed:', error.message);
     console.log('📝 Push notifications will be disabled');
   }
 }
+
+// Initialize on module load
+initializeFirebase();
 
 /**
  * Send push notification to a single device
  */
 async function sendPushNotification(fcmToken, title, body, data = {}) {
   try {
-    if (!admin.apps.length) {
-      console.log('Firebase not initialized, skipping notification');
+    if (!firebaseInitialized) {
+      console.log('⚠️ Firebase not initialized, skipping notification');
       return null;
     }
 
     if (!fcmToken) {
-      console.log('No FCM token provided');
+      console.log('⚠️ No FCM token provided');
       return null;
     }
+
+    console.log(`📱 Sending notification to: ${fcmToken.substring(0, 20)}...`);
 
     const message = {
       notification: {
@@ -38,15 +50,15 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
         body: body
       },
       data: {
-        ...data,
-        click_action: 'FLUTTER_NOTIFICATION_CLICK',
         // Convert all data values to strings (FCM requirement)
         ...Object.keys(data).reduce((acc, key) => {
           acc[key] = String(data[key]);
           return acc;
-        }, {})
+        }, {}),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
       },
       token: fcmToken,
+      
       // Android specific configuration
       android: {
         notification: {
@@ -54,10 +66,14 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
           color: '#2196F3',
           sound: 'default',
           channelId: 'chat_messages',
-          priority: 'high'
+          priority: 'high',
+          defaultSound: true,
+          defaultVibrateTimings: true
         },
-        priority: 'high'
+        priority: 'high',
+        ttl: 3600000 // 1 hour
       },
+      
       // iOS specific configuration
       apns: {
         payload: {
@@ -65,52 +81,61 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
             sound: 'default',
             badge: 1,
             contentAvailable: true,
-            mutableContent: true
+            mutableContent: true,
+            alert: {
+              title: title,
+              body: body
+            }
           }
+        },
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': 'alert'
         }
       }
     };
 
     const response = await admin.messaging().send(message);
-    console.log('📱 Push notification sent successfully:', response);
-    return response;
+    console.log('✅ Push notification sent successfully:', response);
+    return { success: true, messageId: response };
 
   } catch (error) {
     console.error('❌ Error sending push notification:', error);
     
-    // Handle invalid tokens
+    // Handle invalid/expired tokens
     if (error.code === 'messaging/invalid-registration-token' || 
         error.code === 'messaging/registration-token-not-registered') {
-      console.log('🗑️ Invalid FCM token, should remove from database');
-      return { error: 'invalid_token', token: fcmToken };
+      console.log('🗑️ Invalid FCM token, should remove from database:', fcmToken);
+      return { 
+        success: false, 
+        error: 'invalid_token', 
+        token: fcmToken,
+        shouldRemoveToken: true 
+      };
     }
     
-    throw error;
+    return { success: false, error: error.message };
   }
 }
 
 /**
- * Send push notification to multiple devices
+ * Send notification to multiple devices
  */
 async function sendMulticastNotification(fcmTokens, title, body, data = {}) {
   try {
-    if (!admin.apps.length) {
-      console.log('Firebase not initialized, skipping notifications');
+    if (!firebaseInitialized) {
+      console.log('⚠️ Firebase not initialized, skipping notifications');
       return null;
     }
 
-    if (!fcmTokens || fcmTokens.length === 0) {
-      console.log('No FCM tokens provided');
-      return null;
-    }
-
-    // Filter out null/undefined tokens
     const validTokens = fcmTokens.filter(token => token && token.trim() !== '');
     
     if (validTokens.length === 0) {
-      console.log('No valid FCM tokens found');
+      console.log('⚠️ No valid FCM tokens found');
       return null;
     }
+
+    console.log(`📱 Sending notifications to ${validTokens.length} devices`);
 
     const message = {
       notification: {
@@ -118,13 +143,11 @@ async function sendMulticastNotification(fcmTokens, title, body, data = {}) {
         body: body
       },
       data: {
-        ...data,
-        click_action: 'FLUTTER_NOTIFICATION_CLICK',
-        // Convert all data values to strings
         ...Object.keys(data).reduce((acc, key) => {
           acc[key] = String(data[key]);
           return acc;
-        }, {})
+        }, {}),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
       },
       tokens: validTokens,
       android: {
@@ -148,30 +171,49 @@ async function sendMulticastNotification(fcmTokens, title, body, data = {}) {
     };
 
     const response = await admin.messaging().sendMulticast(message);
-    console.log(`📱 Multicast notification sent. Success: ${response.successCount}, Failure: ${response.failureCount}`);
+    console.log(`✅ Multicast sent. Success: ${response.successCount}, Failed: ${response.failureCount}`);
     
-    // Log failed tokens for cleanup
+    // Handle failed tokens
+    const failedTokens = [];
     if (response.failureCount > 0) {
-      const failedTokens = [];
       response.responses.forEach((resp, idx) => {
         if (!resp.success) {
           failedTokens.push(validTokens[idx]);
-          console.error('Failed to send to token:', validTokens[idx], resp.error);
+          console.error('❌ Failed token:', validTokens[idx], resp.error?.code);
         }
       });
-      return { ...response, failedTokens };
     }
     
-    return response;
+    return { 
+      success: true, 
+      successCount: response.successCount,
+      failureCount: response.failureCount,
+      failedTokens 
+    };
 
   } catch (error) {
     console.error('❌ Error sending multicast notification:', error);
-    throw error;
+    return { success: false, error: error.message };
   }
+}
+
+/**
+ * Test notification function
+ */
+async function sendTestNotification(fcmToken) {
+  return await sendPushNotification(
+    fcmToken,
+    '🧪 Test Notification',
+    'If you see this, push notifications are working correctly!',
+    { 
+      test: 'true',
+      timestamp: Date.now().toString()
+    }
+  );
 }
 
 module.exports = {
   sendPushNotification,
-  sendMulticastNotification
+  sendMulticastNotification,
+  sendTestNotification
 };
-

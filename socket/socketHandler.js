@@ -1,5 +1,5 @@
 
-// const { sendPushNotification } = require('../services/pushNotification');
+const { sendPushNotification } = require('../services/pushNotification');
 
 module.exports = (io, pool) => {
   // Authentication middleware for socket
@@ -211,9 +211,31 @@ module.exports = (io, pool) => {
         for (const participant of participantsResult.rows) {
           if (!participant.is_online && participant.fcm_token) {
             try {
-              const notificationText = quotedMessageId 
+              const notificationTitle = `💬 ${socket.user.full_name || socket.user.username}`;
+              const notificationBody = quotedMessageId 
                 ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
                 : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
+              const result = await sendPushNotification(
+                                participant.fcm_token,
+                                notificationTitle,
+                                notificationBody,
+                                { 
+                                  roomId: String(roomId), 
+                                  messageId: String(message.id),
+                                  type: 'new_message',
+                                  senderName: socket.user.username,
+                                  senderId: String(socket.userId)
+                                }
+                                );
+
+                  if (result && result.shouldRemoveToken) {
+                                         await pool.query(
+                                            'UPDATE users SET fcm_token = NULL WHERE id = $1',
+                                                    [participant.id]
+                                                 );
+                                      console.log(`🗑️ Removed invalid FCM token for user ${participant.username}`);
+                                         }
+              
                 /** 
               await sendPushNotification(
                 participant.fcm_token,

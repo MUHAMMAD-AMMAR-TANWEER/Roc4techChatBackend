@@ -612,4 +612,37 @@ router.get('/tasks', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
+
+// Test push notification endpoint
+router.post('/test-notification' , async (req, res) => {
+  try {
+    const { fcmToken, title, body } = req.body;
+    
+    if (!fcmToken) {
+      return res.status(400).json({ error: 'FCM token is required' });
+    }
+
+    const { sendTestNotification } = require('../services/pushNotification');
+    
+    const result = await sendTestNotification(fcmToken);
+    
+    if (result && result.success) {
+      res.json({ 
+        success: true, 
+        message: 'Test notification sent successfully',
+        messageId: result.messageId
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Failed to send notification',
+        details: result ? result.error : 'Unknown error'
+      });
+    }
+
+  } catch (error) {
+    console.error('Test notification error:', error);
+    res.status(500).json({ error: 'Failed to send test notification' });
+  }
+});
+
 module.exports = router;
