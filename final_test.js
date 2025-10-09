@@ -1,7 +1,7 @@
 // fixed-chat-test.js
 const io = require('socket.io-client');
 
-let messageIdForQuote = 5;
+let messageIdForQuote = 1;
 let testStep = 0;
 let user1Connected = false;
 let user2Connected = false;
@@ -9,13 +9,13 @@ let user2Connected = false;
 console.log('🚀 Starting complete chat test between User 1 and User 2...\n');
 
 // Create two socket connections
-const user1Socket = io('http://localhost:4000', { 
-  auth: { userId: '1' },
+const user1Socket = io('https://chat.roc4.live/', { 
+  auth: { userId: '77' },
   forceNew: true
 });
 
-const user2Socket = io('http://localhost:4000', { 
-  auth: { userId: '2' },
+const user2Socket = io('https://chat.roc4.live/', { 
+  auth: { userId: '103' },
   forceNew: true
 });
 
@@ -35,7 +35,7 @@ function nextTest() {
       case 1:
         console.log('\n📝 TEST 1: User 1 sends first message');
         user1Socket.emit('send_message', {
-          roomId: 2,
+          roomId: 1,
           messageText: 'Hello from User 1! How are you?',
           messageType: 'text'
         });
@@ -44,7 +44,7 @@ function nextTest() {
       case 2:
         console.log('\n📝 TEST 2: User 2 replies');
         user2Socket.emit('send_message', {
-          roomId: 2,
+          roomId: 1,
           messageText: 'Hi User 1! I am doing great, thanks for asking!',
           messageType: 'text'
         });
@@ -52,14 +52,14 @@ function nextTest() {
         
       case 3:
         console.log('\n📝 TEST 3: User 1 starts typing');
-        user1Socket.emit('typing_start', { roomId: 2 });
+        user1Socket.emit('typing_start', { roomId: 1 });
         break;
         
       case 4:
         console.log('\n📝 TEST 4: User 1 stops typing and sends message');
-        user1Socket.emit('typing_stop', { roomId: 2 });
+        user1Socket.emit('typing_stop', { roomId: 1 });
         user1Socket.emit('send_message', {
-          roomId: 2,
+          roomId: 1,
           messageText: 'Let me quote your previous message...',
           messageType: 'text'
         });
@@ -69,7 +69,7 @@ function nextTest() {
         if (messageIdForQuote) {
           console.log('\n📝 TEST 5: User 1 sends quoted message');
           user1Socket.emit('send_message', {
-            roomId: 2,
+            roomId: 1,
             messageText: 'Yes, I can see you are doing great! 😊',
             messageType: 'text',
             quotedMessageId: messageIdForQuote
@@ -82,13 +82,13 @@ function nextTest() {
         
       case 6:
         console.log('\n📝 TEST 6: User 2 marks messages as read');
-        user2Socket.emit('mark_messages_read', { roomId: 2 });
+        user2Socket.emit('mark_messages_read', { roomId: 1 });
         break;
         
       case 7:
         console.log('\n📝 TEST 7: User 2 sends final message');
         user2Socket.emit('send_message', {
-          roomId: 2,
+          roomId: 1,
           messageText: 'Thanks for the chat! This socket system works perfectly! 🎉',
           messageType: 'text'
         });
@@ -96,7 +96,7 @@ function nextTest() {
         
       case 8:
         console.log('\n📝 TEST 8: User 1 marks final messages as read');
-        user1Socket.emit('mark_messages_read', { roomId: 2 });
+        user1Socket.emit('mark_messages_read', { roomId: 1 });
         break;
         
       case 9:

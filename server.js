@@ -97,9 +97,6 @@ app.use((error, req, res, next) => {
 });
 
 // Handle 404 for API routes only
-app.use('/api/*', (req, res) => {
-  res.status(404).json({ error: 'API route not found' });
-});
 
 const PORT = process.env.PORT || 4000;
 

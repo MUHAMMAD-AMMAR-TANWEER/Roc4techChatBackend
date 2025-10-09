@@ -21,7 +21,7 @@ const upload = multer({
   },
   fileFilter: (req, file, cb) => {
     // Allow images, documents, and audio files
-    const allowedTypes = /jpeg|jpg|png|gif|webp|pdf|doc|docx|txt|mp3|wav|m4a|ogg|zip|rar/;
+const allowedTypes = /jpeg|jpg|mp4|avi|mov|mkv|webm|flv|wmv|m4v|3gp|ogv|png|gif|webp|pdf|doc|docx|txt|mp3|wav|m4a|ogg|zip|rar/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
     const mimetype = allowedTypes.test(file.mimetype);
 
@@ -34,7 +34,9 @@ const upload = multer({
 });
 
 // Upload file to DigitalOcean Spaces
-router.post('/file', authenticateToken, requireClientOrTechnician, upload.single('file'), async (req, res) => {
+router.post('/file', upload.single('file'), async (req, res) => {
+  const {internal_user_id} = req.body;
+
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -61,17 +63,12 @@ router.post('/file', authenticateToken, requireClientOrTechnician, upload.single
       ACL: 'public-read',
       ContentType: req.file.mimetype,
       CacheControl: 'max-age=31536000', // 1 year cache
-      Metadata: {
-        'original-name': req.file.originalname,
-        'uploaded-by': req.user.internal_user_id,
-        'upload-date': new Date().toISOString()
-      }
     };
 
     const result = await s3.upload(uploadParams).promise();
 
     // Log upload for audit
-    console.log(`📎 File uploaded: ${fileName} by ${req.user.username} (${req.file.size} bytes)`);
+    console.log(`📎 File uploaded: ${fileName} of size (${req.file.size} bytes)`);
 
     res.json({
       success: true,

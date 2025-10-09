@@ -617,23 +617,23 @@ router.get('/tasks', authenticateToken, requireAdmin, async (req, res) => {
 router.post('/test-notification' , async (req, res) => {
   try {
     const { fcmToken, title, body } = req.body;
-    
+
     if (!fcmToken) {
       return res.status(400).json({ error: 'FCM token is required' });
     }
 
     const { sendTestNotification } = require('../services/pushNotification');
-    
+
     const result = await sendTestNotification(fcmToken);
-    
+
     if (result && result.success) {
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: 'Test notification sent successfully',
         messageId: result.messageId
       });
     } else {
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'Failed to send notification',
         details: result ? result.error : 'Unknown error'
       });
@@ -642,6 +642,240 @@ router.post('/test-notification' , async (req, res) => {
   } catch (error) {
     console.error('Test notification error:', error);
     res.status(500).json({ error: 'Failed to send test notification' });
+  }
+});
+
+// Delete all users (WARNING: This is a destructive operation)
+router.delete('/users/delete-all', async (req, res) => {
+  try {
+    const pool = getPool(req);
+    const { confirm } = req.body;
+
+    // Safety check - require explicit confirmation
+    if (confirm !== 'DELETE_ALL_USERS') {
+      return res.status(400).json({
+        error: 'Confirmation required',
+        message: 'To delete all users, send { "confirm": "DELETE_ALL_USERS" } in request body'
+      });
+    }
+
+    // Start transaction
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Get count before deletion
+      const countResult = await client.query('SELECT COUNT(*) FROM users');
+      const totalUsers = parseInt(countResult.rows[0].count);
+
+      // Delete all related data first to avoid foreign key constraints
+      await client.query('DELETE FROM message_reads');
+      await client.query('DELETE FROM messages');
+      await client.query('DELETE FROM chat_rooms');
+
+      // Delete all users
+      const result = await client.query('DELETE FROM users RETURNING id');
+      const deletedCount = result.rows.length;
+
+      await client.query('COMMIT');
+
+      res.json({
+        success: true,
+        message: 'All users deleted successfully',
+        deleted_count: deletedCount,
+        total_users_before: totalUsers,
+        warning: 'All related chat rooms, messages, and message reads were also deleted'
+      });
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.error('Error deleting all users:', error);
+    res.status(500).json({
+      error: 'Failed to delete all users',
+      message: error.message
+    });
+  }
+});
+
+// Delete all tasks (WARNING: This is a destructive operation)
+router.delete('/tasks/delete-all', async (req, res) => {
+  try {
+    const pool = getPool(req);
+    const { confirm } = req.body;
+
+    // Safety check - require explicit confirmation
+    if (confirm !== 'DELETE_ALL_TASKS') {
+      return res.status(400).json({
+        error: 'Confirmation required',
+        message: 'To delete all tasks, send { "confirm": "DELETE_ALL_TASKS" } in request body'
+      });
+    }
+
+    // Start transaction
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Get count before deletion
+      const countResult = await client.query('SELECT COUNT(*) FROM tasks');
+      const totalTasks = parseInt(countResult.rows[0].count);
+
+      // Delete all related data first to avoid foreign key constraints
+      await client.query('DELETE FROM message_reads');
+      await client.query('DELETE FROM messages');
+      await client.query('DELETE FROM chat_rooms');
+
+      // Delete all tasks
+      const result = await client.query('DELETE FROM tasks RETURNING id');
+      const deletedCount = result.rows.length;
+
+      await client.query('COMMIT');
+
+      res.json({
+        success: true,
+        message: 'All tasks deleted successfully',
+        deleted_count: deletedCount,
+        total_tasks_before: totalTasks,
+        warning: 'All related chat rooms, messages, and message reads were also deleted'
+      });
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.error('Error deleting all tasks:', error);
+    res.status(500).json({
+      error: 'Failed to delete all tasks',
+      message: error.message
+    });
+  }
+});
+
+// Get all chat rooms (simplified version without pagination)
+router.get('/rooms/all', async (req, res) => {
+  try {
+    const pool = getPool(req);
+
+    const result = await pool.query(`
+      SELECT
+        cr.id as room_id,
+        cr.room_name,
+        cr.created_at as room_created,
+        cr.last_message_at,
+        cr.is_active,
+        client.id as client_id,
+        client.internal_user_id as client_internal_id,
+        client.username as client_username,
+        client.full_name as client_name,
+        client.is_online as client_online,
+        tech.id as technician_id,
+        tech.internal_user_id as technician_internal_id,
+        tech.username as technician_username,
+        tech.full_name as technician_name,
+        tech.is_online as technician_online,
+        t.id as task_id,
+        t.task_name,
+        t.internal_task_id,
+        latest_msg.message_text as last_message,
+        latest_msg.message_type as last_message_type,
+        latest_msg.created_at as last_message_time,
+        sender.username as last_sender,
+        (SELECT COUNT(*) FROM messages WHERE room_id = cr.id) as total_messages,
+        (SELECT COUNT(*) FROM messages WHERE room_id = cr.id AND is_read = false) as unread_messages
+      FROM chat_rooms cr
+      JOIN users client ON cr.client_id = client.id
+      JOIN users tech ON cr.technician_id = tech.id
+      JOIN tasks t ON cr.task_id = t.id
+      LEFT JOIN LATERAL (
+        SELECT m.message_text, m.message_type, m.created_at, m.sender_id
+        FROM messages m
+        WHERE m.room_id = cr.id
+        ORDER BY m.created_at DESC
+        LIMIT 1
+      ) latest_msg ON true
+      LEFT JOIN users sender ON latest_msg.sender_id = sender.id
+      ORDER BY cr.last_message_at DESC NULLS LAST, cr.created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      total_rooms: result.rows.length,
+      rooms: result.rows
+    });
+
+  } catch (error) {
+    console.error('Error fetching all rooms:', error);
+    res.status(500).json({ error: 'Failed to fetch all chat rooms' });
+  }
+});
+
+// Delete all chat rooms (WARNING: This is a destructive operation)
+router.delete('/rooms/delete-all', async (req, res) => {
+  try {
+    const pool = getPool(req);
+    const { confirm } = req.body;
+
+    // Safety check - require explicit confirmation
+    if (confirm !== 'DELETE_ALL_ROOMS') {
+      return res.status(400).json({
+        error: 'Confirmation required',
+        message: 'To delete all chat rooms, send { "confirm": "DELETE_ALL_ROOMS" } in request body'
+      });
+    }
+
+    // Start transaction
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Get count before deletion
+      const countResult = await client.query('SELECT COUNT(*) FROM chat_rooms');
+      const totalRooms = parseInt(countResult.rows[0].count);
+
+      // Delete all related data first to avoid foreign key constraints
+      await client.query('DELETE FROM message_reads');
+      await client.query('DELETE FROM messages');
+
+      // Delete all chat rooms
+      const result = await client.query('DELETE FROM chat_rooms RETURNING id');
+      const deletedCount = result.rows.length;
+
+      await client.query('COMMIT');
+
+      res.json({
+        success: true,
+        message: 'All chat rooms deleted successfully',
+        deleted_count: deletedCount,
+        total_rooms_before: totalRooms,
+        warning: 'All related messages and message reads were also deleted'
+      });
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+  } catch (error) {
+    console.error('Error deleting all chat rooms:', error);
+    res.status(500).json({
+      error: 'Failed to delete all chat rooms',
+      message: error.message
+    });
   }
 });
 

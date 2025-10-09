@@ -71,7 +71,7 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
           defaultVibrateTimings: true
         },
         priority: 'high',
-        ttl: 3600000 // 1 hour
+        ttl: 10 // 1 hour
       },
       
       // iOS specific configuration

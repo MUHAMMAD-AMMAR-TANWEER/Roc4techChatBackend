@@ -1,9 +1,5 @@
 
-<<<<<<< HEAD
-// const { sendPushNotification } = require('../services/pushNotification');
-=======
 const { sendPushNotification } = require('../services/pushNotification');
->>>>>>> 85ef287a5d84166fd32e14da0e5903553609ca3a
 
 module.exports = (io, pool) => {
   // Authentication middleware for socket
@@ -215,11 +211,6 @@ module.exports = (io, pool) => {
         for (const participant of participantsResult.rows) {
           if (!participant.is_online && participant.fcm_token) {
             try {
-<<<<<<< HEAD
-              const notificationText = quotedMessageId 
-                ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
-                : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
-=======
               const notificationTitle = `💬 ${socket.user.full_name || socket.user.username}`;
               const notificationBody = quotedMessageId 
                 ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
@@ -245,7 +236,6 @@ module.exports = (io, pool) => {
                                       console.log(`🗑️ Removed invalid FCM token for user ${participant.username}`);
                                          }
               
->>>>>>> 85ef287a5d84166fd32e14da0e5903553609ca3a
                 /** 
               await sendPushNotification(
                 participant.fcm_token,
@@ -332,6 +322,100 @@ module.exports = (io, pool) => {
       } catch (error) {
         console.error('Error marking messages as read:', error);
         socket.emit('error', { message: 'Failed to mark messages as read' });
+      }
+    });
+
+
+    // Handle loading previous messages (pagination)
+    socket.on('load_previous_messages', async (data) => {
+      try {
+        const { roomId, page = 1, limit = 20, beforeMessageId } = data;
+        
+        if (!roomId) {
+          return socket.emit('error', { message: 'Room ID is required' });
+        }
+
+        // Verify user has access to this room
+        const accessCheck = await pool.query(
+          'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
+          [roomId, socket.userId]
+        );
+
+        if (accessCheck.rows.length === 0) {
+          return socket.emit('error', { message: 'Access denied to this room' });
+        }
+
+        let query, params;
+        
+        if (beforeMessageId) {
+          // Load messages before a specific message ID (more precise pagination)
+          query = `
+            SELECT 
+              m.*,
+              u.username as sender_username,
+              u.full_name as sender_name,
+              u.avatar_url as sender_avatar,
+              u.user_type as sender_type
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.room_id = $1 AND m.id < $2
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT $3
+          `;
+          params = [roomId, beforeMessageId, limit];
+        } else {
+          // Load messages by page number
+          const offset = (page - 1) * limit;
+          query = `
+            SELECT 
+              m.*,
+              u.username as sender_username,
+              u.full_name as sender_name,
+              u.avatar_url as sender_avatar,
+              u.user_type as sender_type
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.room_id = $1
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT $2 OFFSET $3
+          `;
+          params = [roomId, limit, offset];
+        }
+
+        const messagesResult = await pool.query(query, params);
+        
+        // Get total message count for this room
+        const countResult = await pool.query(
+          'SELECT COUNT(*) FROM messages WHERE room_id = $1',
+          [roomId]
+        );
+
+        const totalMessages = parseInt(countResult.rows[0].count);
+        const hasMore = beforeMessageId 
+          ? messagesResult.rows.length === limit // If we got full limit, likely more exist
+          : (page * limit) < totalMessages;
+
+        // Reverse messages to show chronological order (oldest first)
+        const messages = messagesResult.rows.reverse();
+
+        // Emit the previous messages back to the requesting socket
+        socket.emit('previous_messages', {
+          roomId: roomId,
+          messages: messages,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: totalMessages,
+            hasMore: hasMore,
+            beforeMessageId: beforeMessageId
+          }
+        });
+
+        console.log(`📚 Loaded ${messages.length} previous messages for room ${roomId}, page ${page}`);
+        
+      } catch (error) {
+        console.error('Error loading previous messages:', error);
+        socket.emit('error', { message: 'Failed to load previous messages' });
       }
     });
 
