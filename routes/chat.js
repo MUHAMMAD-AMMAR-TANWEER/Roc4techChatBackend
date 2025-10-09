@@ -5,6 +5,430 @@ const router = express.Router();
 // Get database pool from app locals
 const getPool = (req) => req.app.locals.pool;
 
+
+
+router.post('/api/send_message_from_odoo', async (req, res) => {
+  try {
+    const { 
+      roomId,
+      senderInternalId,
+      senderName, 
+      messageText, 
+      messageType = 'text',
+      userType = 'technician',
+      source = 'odoo'
+    } = req.body;
+    
+    console.log('[ODOO→CHAT] Received:', {
+      roomId,
+      senderInternalId,
+      senderName,
+      messageLength: messageText?.length
+    });
+    
+    if (!roomId || !senderInternalId || !messageText) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: roomId, senderInternalId, messageText' 
+      });
+    }
+    
+    const pool = getPool(req);
+    const io = req.app.locals.io;
+    
+    // Find chat user by internal ID
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE internal_user_id = $1',
+      [senderInternalId.toString()]
+    );
+    
+    let chatUserId;
+    if (userResult.rows.length > 0) {
+      chatUserId = userResult.rows[0].id;
+    } else {
+      // Create user if doesn't exist
+      console.log(`[ODOO→CHAT] Creating user for internal_id ${senderInternalId}`);
+      const newUser = await pool.query(`
+        INSERT INTO users (internal_user_id, username, full_name, user_type, is_active)
+        VALUES ($1, $2, $3, $4, true)
+        RETURNING id
+      `, [senderInternalId.toString(), senderName, senderName, userType]);
+      chatUserId = newUser.rows[0].id;
+    }
+    
+    // Get room details
+    const room = await pool.query(`
+      SELECT 
+        cr.id,
+        cr.client_id,
+        cr.technician_id,
+        client.internal_user_id as client_internal_id,
+        tech.internal_user_id as technician_internal_id
+      FROM chat_rooms cr
+      JOIN users client ON cr.client_id = client.id
+      JOIN users tech ON cr.technician_id = tech.id
+      WHERE cr.id = $1
+    `, [roomId]);
+    
+    if (room.rows.length === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    
+    const roomData = room.rows[0];
+    
+    // Determine receiver
+    const receiverChatId = roomData.client_id === chatUserId
+      ? roomData.technician_id
+      : roomData.client_id;
+    
+    const receiverInternalId = roomData.client_id === chatUserId
+      ? roomData.technician_internal_id
+      : roomData.client_internal_id;
+    
+    // Save message
+    const message = await pool.query(`
+      INSERT INTO messages (
+        room_id, 
+        sender_id, 
+        sender_internal_id,
+        receiver_id,
+        receiver_internal_id,
+        message_text, 
+        message_type,
+        source
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `, [
+      roomId, 
+      chatUserId, 
+      senderInternalId.toString(),
+      receiverChatId,
+      receiverInternalId,
+      messageText, 
+      messageType,
+      source
+    ]);
+    
+    // Get full message with sender details
+    const fullMessage = await pool.query(`
+      SELECT 
+        m.*,
+        u.username as sender_username,
+        u.full_name as sender_name,
+        u.avatar_url as sender_avatar,
+        u.user_type as sender_type
+      FROM messages m
+      JOIN users u ON m.sender_id = u.id
+      WHERE m.id = $1
+    `, [message.rows[0].id]);
+    
+    // Broadcast via Socket.IO
+    io.to(`room_${roomId}`).emit('new_message', fullMessage.rows[0]);
+    
+    // Send push notification to receiver
+    const receiverResult = await pool.query(
+      'SELECT id, fcm_token, username, is_online FROM users WHERE id = $1',
+      [receiverChatId]
+    );
+    
+    if (receiverResult.rows.length > 0) {
+      const receiver = receiverResult.rows[0];
+      
+      if (!receiver.is_online && receiver.fcm_token) {
+        try {
+          const { sendPushNotification } = require('../services/pushNotification');
+          
+          const result = await sendPushNotification(
+            receiver.fcm_token,
+            `💬 ${senderName}`,
+            messageText,
+            { 
+              roomId: String(roomId), 
+              messageId: String(message.rows[0].id),
+              type: 'new_message',
+              senderName: senderName,
+              senderId: String(chatUserId),
+              source: 'odoo'
+            }
+          );
+
+          if (result && result.shouldRemoveToken) {
+            await pool.query(
+              'UPDATE users SET fcm_token = NULL WHERE id = $1',
+              [receiver.id]
+            );
+          }
+        } catch (notificationError) {
+          console.error(`Failed to send push notification:`, notificationError);
+        }
+      }
+    }
+    
+    console.log(`[ODOO→CHAT] ✅ Message saved and broadcasted to room ${roomId}`);
+    
+    res.json({ 
+      success: true, 
+      message_id: message.rows[0].id,
+      room_id: roomId
+    });
+    
+  } catch (error) {
+    console.error('[ODOO→CHAT] ❌ Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create multiple rooms for task
+router.post('/api/chat/rooms/create-for-task', async (req, res) => {
+  try {
+    const {
+      client_internal_id,
+      technician_internal_ids,
+      task_internal_id,
+      admin_internal_id
+    } = req.body;
+
+    const pool = getPool(req);
+
+    console.log('[ROOM CREATE] Request:', {
+      client_internal_id,
+      technician_internal_ids,
+      task_internal_id,
+      admin_internal_id
+    });
+
+    if (!client_internal_id || !technician_internal_ids || !task_internal_id) {
+      return res.status(400).json({ 
+        error: 'client_internal_id, technician_internal_ids array, and task_internal_id required' 
+      });
+    }
+
+    if (!Array.isArray(technician_internal_ids)) {
+      return res.status(400).json({ error: 'technician_internal_ids must be an array' });
+    }
+
+    // Get client
+    const clientResult = await pool.query(
+      'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1 AND user_type = $2',
+      [client_internal_id.toString(), 'client']
+    );
+
+    if (clientResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    const clientId = clientResult.rows[0].id;
+
+    // Get task
+    const taskResult = await pool.query(
+      'SELECT id, task_name, internal_task_id FROM tasks WHERE internal_task_id = $1',
+      [task_internal_id.toString()]
+    );
+
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const taskId = taskResult.rows[0].id;
+    const taskName = taskResult.rows[0].task_name;
+
+    const createdRooms = [];
+    const failedTechnicians = [];
+
+    // Create room for each technician
+    for (const tech_internal_id of technician_internal_ids) {
+      try {
+        const techResult = await pool.query(
+          'SELECT id, username, full_name, internal_user_id, user_type FROM users WHERE internal_user_id = $1',
+          [tech_internal_id.toString()]
+        );
+
+        if (techResult.rows.length === 0) {
+          failedTechnicians.push({ 
+            technician_internal_id: tech_internal_id, 
+            reason: 'Not found' 
+          });
+          continue;
+        }
+
+        const techId = techResult.rows[0].id;
+        const techName = techResult.rows[0].full_name;
+
+        const roomResult = await pool.query(`
+          INSERT INTO chat_rooms (
+            client_id, 
+            technician_id, 
+            task_id,
+            room_name,
+            room_type
+          )
+          VALUES ($1, $2, $3, $4, 'task_chat')
+          ON CONFLICT (client_id, technician_id, task_id)
+          DO UPDATE SET 
+            updated_at = CURRENT_TIMESTAMP,
+            is_active = true
+          RETURNING *
+        `, [clientId, techId, taskId, `${taskName} - ${techName}`]);
+
+        createdRooms.push({
+          room_id: roomResult.rows[0].id,
+          technician_name: techName,
+          technician_internal_id: tech_internal_id,
+          client_name: clientResult.rows[0].full_name
+        });
+
+      } catch (error) {
+        failedTechnicians.push({ 
+          technician_internal_id: tech_internal_id, 
+          reason: error.message 
+        });
+      }
+    }
+
+    // Create admin room if provided
+    if (admin_internal_id) {
+      try {
+        const adminResult = await pool.query(
+          'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1',
+          [admin_internal_id.toString()]
+        );
+
+        if (adminResult.rows.length > 0) {
+          const adminId = adminResult.rows[0].id;
+          const adminName = adminResult.rows[0].full_name;
+
+          const roomResult = await pool.query(`
+            INSERT INTO chat_rooms (
+              client_id, 
+              technician_id, 
+              task_id,
+              room_name,
+              room_type
+            )
+            VALUES ($1, $2, $3, $4, 'task_chat')
+            ON CONFLICT (client_id, technician_id, task_id)
+            DO UPDATE SET 
+              updated_at = CURRENT_TIMESTAMP,
+              is_active = true
+            RETURNING *
+          `, [clientId, adminId, taskId, `${taskName} - ${adminName} (Admin)`]);
+
+          createdRooms.push({
+            room_id: roomResult.rows[0].id,
+            technician_name: `${adminName} (Admin)`,
+            technician_internal_id: admin_internal_id,
+            is_admin: true
+          });
+        }
+      } catch (error) {
+        console.error('Failed to create admin room:', error);
+      }
+    }
+
+    console.log(`[ROOM CREATE] ✅ Created ${createdRooms.length} rooms for task ${task_internal_id}`);
+
+    res.json({
+      success: true,
+      task_internal_id: task_internal_id,
+      task_name: taskName,
+      rooms_created: createdRooms.length,
+      rooms: createdRooms,
+      failed: failedTechnicians
+    });
+
+  } catch (error) {
+    console.error('[ROOM CREATE] Error:', error);
+    res.status(500).json({ error: 'Failed to create task rooms' });
+  }
+});
+
+// Get rooms grouped by task
+router.get('/api/chat/rooms/grouped', async (req, res) => {
+  try {
+    const { internal_user_id, user_type } = req.query;
+    const pool = getPool(req);
+
+    if (!internal_user_id || !user_type) {
+      return res.status(400).json({ 
+        error: 'internal_user_id and user_type required' 
+      });
+    }
+
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE internal_user_id = $1 AND user_type = $2',
+      [internal_user_id, user_type]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userId = userResult.rows[0].id;
+
+    // Get rooms grouped by task
+    const roomsResult = await pool.query(`
+      SELECT 
+        t.internal_task_id,
+        t.task_name,
+        json_agg(
+          json_build_object(
+            'room_id', cr.id,
+            'other_user_id', 
+              CASE WHEN cr.client_id = $1 THEN cr.technician_id ELSE cr.client_id END,
+            'other_user_name',
+              CASE WHEN cr.client_id = $1 THEN tech.full_name ELSE client.full_name END,
+            'other_user_username',
+              CASE WHEN cr.client_id = $1 THEN tech.username ELSE client.username END,
+            'other_user_type',
+              CASE WHEN cr.client_id = $1 THEN tech.user_type ELSE client.user_type END,
+            'other_user_internal_id',
+              CASE WHEN cr.client_id = $1 THEN tech.internal_user_id ELSE client.internal_user_id END,
+            'other_user_online',
+              CASE WHEN cr.client_id = $1 THEN tech.is_online ELSE client.is_online END,
+            'unread_count',
+              (SELECT COUNT(*) FROM messages 
+               WHERE room_id = cr.id AND sender_id != $1 AND is_read = false),
+            'last_message',
+              (SELECT message_text FROM messages 
+               WHERE room_id = cr.id 
+               ORDER BY created_at DESC LIMIT 1),
+            'last_message_time',
+              (SELECT created_at FROM messages 
+               WHERE room_id = cr.id 
+               ORDER BY created_at DESC LIMIT 1),
+            'last_message_sender',
+              (SELECT u.username FROM messages m
+               JOIN users u ON m.sender_id = u.id
+               WHERE m.room_id = cr.id 
+               ORDER BY m.created_at DESC LIMIT 1)
+          ) ORDER BY cr.created_at
+        ) as rooms
+      FROM chat_rooms cr
+      JOIN users client ON cr.client_id = client.id
+      JOIN users tech ON cr.technician_id = tech.id
+      JOIN tasks t ON cr.task_id = t.id
+      WHERE (cr.client_id = $1 OR cr.technician_id = $1) AND cr.is_active = true
+      GROUP BY t.internal_task_id, t.task_name
+      ORDER BY MAX(COALESCE(
+        (SELECT created_at FROM messages WHERE room_id = cr.id ORDER BY created_at DESC LIMIT 1),
+        cr.created_at
+      )) DESC
+    `, [userId]);
+
+    res.json({
+      success: true,
+      user_type: user_type,
+      tasks_count: roomsResult.rows.length,
+      tasks: roomsResult.rows
+    });
+
+  } catch (error) {
+    console.error('Error fetching grouped rooms:', error);
+    res.status(500).json({ error: 'Failed to fetch grouped rooms' });
+  }
+});
+
 // Sync/Create task from your system
 router.post('/tasks/sync', async (req, res) => {
   try {

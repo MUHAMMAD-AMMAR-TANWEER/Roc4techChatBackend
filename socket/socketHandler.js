@@ -1,5 +1,75 @@
 
 const { sendPushNotification } = require('../services/pushNotification');
+const axios = require('axios');
+
+const ODOO_SYNC_CONFIG = {
+  enabled: true,
+  apiUrl: 'https://roc4.live/api/chat/sync_message',
+  timeout: 5000
+};
+
+
+async function syncMessageToOdoo(messageData, pool) {
+  if (!ODOO_SYNC_CONFIG.enabled) {
+    console.log('[ODOO SYNC] Sync disabled');
+    return false;
+  }
+
+  try {
+    const payload = {
+      internal_task_id: messageData.room_id,
+      sender_internal_id: messageData.sender_internal_id,
+      receiver_internal_id: messageData.receiver_internal_id,
+      message_text: messageData.message_text,
+      message_type: messageData.message_type,
+      timestamp: messageData.created_at,
+      message_id: messageData.id,
+      sender_name: messageData.sender_name,
+      sender_type: messageData.sender_type,
+      quoted_message_text: messageData.quoted_message_text,
+      quoted_sender_name: messageData.quoted_sender_name
+    };
+
+    console.log('[ODOO SYNC] 📤 Syncing:', {
+      message_id: payload.message_id,
+      task_id: payload.internal_task_id,
+      sender: payload.sender_name
+    });
+
+    const response = await axios.post(
+      ODOO_SYNC_CONFIG.apiUrl,
+      payload,
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: ODOO_SYNC_CONFIG.timeout
+      }
+    );
+
+    if (response.data.success) {
+      console.log('[ODOO SYNC] ✅ Synced successfully');
+      
+      await pool.query(
+        'UPDATE messages SET synced_to_odoo = true, synced_at = CURRENT_TIMESTAMP WHERE id = $1',
+        [messageData.id]
+      );
+      
+      return true;
+    } else {
+      console.error('[ODOO SYNC] ❌ Failed:', response.data.error);
+      return false;
+    }
+  } catch (error) {
+    if (error.code === 'ECONNABORTED') {
+      console.error('[ODOO SYNC] ❌ Timeout');
+    } else if (error.code === 'ECONNREFUSED') {
+      console.error('[ODOO SYNC] ❌ Connection refused');
+    } else {
+      console.error('[ODOO SYNC] ❌ Error:', error.message);
+    }
+    return false;
+  }
+}
+
 
 module.exports = (io, pool) => {
   // Authentication middleware for socket
@@ -90,6 +160,7 @@ module.exports = (io, pool) => {
             cr.*,
             client.username as client_username,
             client.full_name as client_name,
+            client.internal_user_id as client_internal_id,
             tech.username as technician_username,
             tech.full_name as technician_name,
             t.task_name,
@@ -148,36 +219,102 @@ module.exports = (io, pool) => {
         }
 
         // Verify user has access to this room
-        const accessCheck = await pool.query(
-          'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
-          [roomId, socket.userId]
-        );
+        const accessCheck = await pool.query(`
+          SELECT 
+            cr.id,
+            cr.client_id,
+            cr.technician_id,
+            cr.task_id,
+            client.internal_user_id as client_internal_id,
+            tech.internal_user_id as technician_internal_id,
+            t.internal_task_id
+          FROM chat_rooms cr
+          JOIN users client ON cr.client_id = client.id
+          JOIN users tech ON cr.technician_id = tech.id
+          JOIN tasks t ON cr.task_id = t.id
+          WHERE cr.id = $1 AND (cr.client_id = $2 OR cr.technician_id = $2)
+        `, [roomId, socket.userId]);
 
         if (accessCheck.rows.length === 0) {
           return socket.emit('error', { message: 'Access denied to this room' });
         }
 
+        const room = accessCheck.rows[0];
+
+
+        // Extract internal IDs from room
+        const senderInternalId = socket.user.internal_user_id;
+        const receiverChatId = room.client_id === socket.userId 
+          ? room.technician_id 
+          : room.client_id;
+        
+        const receiverInternalId = room.client_id === socket.userId
+          ? room.technician_internal_id
+          : room.client_internal_id;
+
+        console.log('[MESSAGE] 📝 IDs:', {
+          sender_chat_id: socket.userId,
+          sender_internal_id: senderInternalId,
+          receiver_chat_id: receiverChatId,
+          receiver_internal_id: receiverInternalId,
+          task_internal_id: room.internal_task_id
+        });
+
         // Validate quoted message if provided
+        let quotedMessageText = null;
+        let quotedSenderName = null;
+
         if (quotedMessageId) {
-          const quotedResult = await pool.query(
-            'SELECT id FROM messages WHERE id = $1 AND room_id = $2',
-            [quotedMessageId, roomId]
-          );
+          const quotedResult = await pool.query(`
+            SELECT m.message_text, u.full_name 
+            FROM messages m 
+            JOIN users u ON m.sender_id = u.id 
+            WHERE m.id = $1 AND m.room_id = $2
+          `, [quotedMessageId, roomId]);
           
           if (quotedResult.rows.length === 0) {
             return socket.emit('error', { message: 'Quoted message not found in this room' });
           }
+
+          quotedMessageText = quotedResult.rows[0].message_text;
+          quotedSenderName = quotedResult.rows[0].full_name;
         }
+
 
         // Insert message (trigger will populate quoted message details automatically)
         const messageResult = await pool.query(`
           INSERT INTO messages (
-            room_id, sender_id, message_text, message_type, 
-            file_url, file_name, file_size, quoted_message_id
+            room_id, 
+            sender_id, 
+            sender_internal_id,
+            receiver_id,
+            receiver_internal_id,
+            message_text, 
+            message_type, 
+            file_url, 
+            file_name, 
+            file_size, 
+            quoted_message_id,
+            quoted_message_text,
+            quoted_sender_name
           ) 
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) 
           RETURNING *
-        `, [roomId, socket.userId, messageText, messageType, fileUrl, fileName, fileSize, quotedMessageId]);
+        `, [
+          roomId, 
+          socket.userId, 
+          senderInternalId,
+          receiverChatId,
+          receiverInternalId,
+          messageText, 
+          messageType, 
+          fileUrl, 
+          fileName, 
+          fileSize, 
+          quotedMessageId,
+          quotedMessageText,
+          quotedSenderName
+        ]);
         
         const message = messageResult.rows[0];
         
@@ -198,6 +335,25 @@ module.exports = (io, pool) => {
         
         // Broadcast to room
         io.to(`room_${roomId}`).emit('new_message', fullMessage);
+
+                // SYNC TO ODOO (non-blocking)
+        syncMessageToOdoo({
+          id: fullMessage.id,
+          room_id: room.internal_task_id,
+          sender_id: socket.userId,
+          sender_internal_id: senderInternalId,
+          receiver_id: receiverChatId,
+          receiver_internal_id: receiverInternalId,
+          message_text: messageText,
+          message_type: messageType,
+          sender_name: socket.user.full_name || socket.user.username,
+          sender_type: socket.user.user_type,
+          quoted_message_text: quotedMessageText,
+          quoted_sender_name: quotedSenderName,
+          created_at: fullMessage.created_at
+        }, pool).catch(err => {
+          console.error('[ODOO SYNC] Failed but continuing:', err.message);
+        });
         
         // Get room participants for push notifications
         const participantsResult = await pool.query(`

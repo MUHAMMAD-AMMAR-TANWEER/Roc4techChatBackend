@@ -4,9 +4,17 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
 require('dotenv').config();
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
+
+
+// ODOO chat integration 
+
+const ODOO_API_URL = 'https://roc4.live/api/chat/sync_message';
+const ODOO_READ_STATUS_URL = 'https://roc4.live/api/chat/sync_read_status';
+
 
 // Updated CORS origins to include your subdomain
 const allowedOrigins = [
