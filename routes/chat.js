@@ -134,30 +134,47 @@ router.post('/api/send_message_from_odoo', async (req, res) => {
     if (receiverResult.rows.length > 0) {
       const receiver = receiverResult.rows[0];
       
-      if (!receiver.is_online && receiver.fcm_token) {
+      if (!receiver.is_online) {
         try {
-          const { sendPushNotification } = require('../services/pushNotification');
           
-          const result = await sendPushNotification(
-            receiver.fcm_token,
-            `💬 ${senderName}`,
-            messageText,
-            { 
-              roomId: String(roomId), 
-              messageId: String(message.rows[0].id),
-              type: 'new_message',
-              senderName: senderName,
-              senderId: String(chatUserId),
-              source: 'odoo'
-            }
-          );
 
-          if (result && result.shouldRemoveToken) {
-            await pool.query(
-              'UPDATE users SET fcm_token = NULL WHERE id = $1',
-              [receiver.id]
-            );
+          const devicesResult = await pool.query(`
+           SELECT fcm_token, device_name, id
+             FROM user_devices
+             WHERE user_id = $1 AND is_active = true AND fcm_token IS NOT NULL
+           `, [receiver.id]);
+          console.log(`[ODOO→PUSH] Sending to ${devicesResult.rows.length} device(s)`);
+
+      for (const device of devicesResult.rows){
+
+
+        const { sendPushNotification } = require('../services/pushNotification');
+
+        const result = await sendPushNotification(
+          device.fcm_token,
+          `💬 ${senderName}`,
+          messageText,
+          { 
+            roomId: String(roomId), 
+            messageId: String(message.rows[0].id),
+            type: 'new_message',
+            senderName: senderName,
+            senderId: String(chatUserId),
+            source: 'odoo'
           }
+        );
+
+        if (result && result.shouldRemoveToken) {
+          await pool.query(
+            'UPDATE user_devices SET is_active = false WHERE id = $1',
+            [device.id]
+          );
+        }
+
+
+
+      }
+          
         } catch (notificationError) {
           console.error(`Failed to send push notification:`, notificationError);
         }

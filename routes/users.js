@@ -384,7 +384,14 @@ router.post('/logout', authenticateToken, async (req, res) => {
 
 router.post('/fcm/register', async (req, res) => {
   try {
-    const { internal_user_id, fcmToken } = req.body;
+    const { 
+      internal_user_id, 
+      fcmToken,
+      device_id,      // Optional but recommended
+      device_name,    // Optional: "John's iPhone"
+      device_type     // Optional: "ios", "android", "web"
+    } = req.body;
+    
     const pool = getPool(req);
 
     if (!internal_user_id || !fcmToken) {
@@ -393,21 +400,46 @@ router.post('/fcm/register', async (req, res) => {
       });
     }
 
-    const result = await pool.query(`
-      UPDATE users 
-      SET fcm_token = $1, updated_at = CURRENT_TIMESTAMP 
-      WHERE internal_user_id = $2 AND is_active = true
-      RETURNING id, internal_user_id, username
-    `, [fcmToken, internal_user_id]);
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE internal_user_id = $1 AND is_active = true',
+      [internal_user_id]
+    );
 
-    if (result.rows.length === 0) {
+    if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found or inactive' });
     }
+
+    const userId = userResult.rows[0].id;
+
+    // Insert or update device token
+    const result = await pool.query(`
+      INSERT INTO user_devices (
+        user_id, 
+        fcm_token, 
+        device_id, 
+        device_name, 
+        device_type,
+        last_used_at
+      )
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      ON CONFLICT (fcm_token) 
+      DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        device_id = EXCLUDED.device_id,
+        device_name = EXCLUDED.device_name,
+        device_type = EXCLUDED.device_type,
+        is_active = true,
+        last_used_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING id, fcm_token, device_name
+    `, [userId, fcmToken, device_id, device_name, device_type]);
 
     res.json({ 
       success: true, 
       message: 'FCM token registered successfully',
-      user: result.rows[0]
+      device: result.rows[0],
+      internal_user_id: internal_user_id
     });
 
   } catch (error) {
@@ -437,29 +469,62 @@ router.delete('/fcm/remove/:internal_user_id', async (req, res) => {
   }
 });
 
-router.get('/fcm/token/:internal_user_id', async (req, res) => {
+
+router.delete('/fcm/removenew', async (req, res) => {
+  try {
+    const { internal_user_id, fcmToken } = req.body;
+    const pool = getPool(req);
+
+    if (!fcmToken) {
+      return res.status(400).json({ error: 'fcmToken is required' });
+    }
+
+    // Soft delete - mark as inactive
+    await pool.query(`
+      UPDATE user_devices 
+      SET is_active = false, updated_at = CURRENT_TIMESTAMP
+      WHERE fcm_token = $1
+    `, [fcmToken]);
+
+    res.json({ 
+      success: true, 
+      message: 'FCM token removed successfully' 
+    });
+
+  } catch (error) {
+    console.error('Error removing FCM token:', error);
+    res.status(500).json({ error: 'Failed to remove FCM token' });
+  }
+});
+
+router.get('/fcm/devices/:internal_user_id', async (req, res) => {
   try {
     const { internal_user_id } = req.params;
     const pool = getPool(req);
 
-    const result = await pool.query(
-      'SELECT fcm_token, username FROM users WHERE internal_user_id = $1',
-      [internal_user_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const result = await pool.query(`
+      SELECT 
+        ud.id,
+        ud.device_id,
+        ud.device_name,
+        ud.device_type,
+        ud.last_used_at,
+        ud.created_at
+      FROM user_devices ud
+      JOIN users u ON ud.user_id = u.id
+      WHERE u.internal_user_id = $1 AND ud.is_active = true
+      ORDER BY ud.last_used_at DESC
+    `, [internal_user_id]);
 
     res.json({ 
       success: true,
-      fcmToken: result.rows[0].fcm_token,
-      username: result.rows[0].username
+      device_count: result.rows.length,
+      devices: result.rows
     });
 
   } catch (error) {
-    console.error('Error getting FCM token:', error);
-    res.status(500).json({ error: 'Failed to get FCM token' });
+    console.error('Error getting devices:', error);
+    res.status(500).json({ error: 'Failed to get devices' });
   }
 });
 
@@ -469,38 +534,53 @@ router.post('/fcm/test-push', async (req, res) => {
     const { internal_user_id, title = 'Test Notification', body = 'This is a test', roomId } = req.body;
     const pool = getPool(req);
     
-    const result = await pool.query(
-      'SELECT fcm_token, username FROM users WHERE internal_user_id = $1',
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id FROM users WHERE internal_user_id = $1',
       [internal_user_id]
     );
     
-    if (result.rows.length === 0 || !result.rows[0].fcm_token) {
-      return res.status(404).json({ error: 'User not found or no FCM token' });
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    let redirectUrl  = `https://chat.roc4.live/api/rooms/${roomId}/messages`
-    
-    // Import your sendPushNotification function
+    // Get all active devices
+    const devicesResult = await pool.query(`
+      SELECT fcm_token, device_name
+      FROM user_devices
+      WHERE user_id = $1 AND is_active = true AND fcm_token IS NOT NULL
+    `, [userResult.rows[0].id]);
+
+    if (devicesResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No active devices found' });
+    }
+
     const { sendPushNotification } = require('../services/pushNotification');
-    
-    const pushResult = await sendPushNotification(
-      result.rows[0].fcm_token,
-      title,
-      body,
+    const results = [];
+
+    // Send to all devices
+    for (const device of devicesResult.rows) {
+      const pushResult = await sendPushNotification(
+        device.fcm_token,
+        title,
+        body,
+        { 
+          type: 'test',
+          userId: internal_user_id,
+          roomId: roomId
+        }
+      );
       
-      { 
-        type: 'test',
-        userId: internal_user_id,
-        redirectUrl: redirectUrl,
-        roomId:roomId
-      }
-    );
-    console.log('Push result:', pushResult);
+      results.push({
+        device: device.device_name || 'Unknown',
+        success: !pushResult?.shouldRemoveToken
+      });
+    }
     
     res.json({ 
       success: true, 
-      message: 'Test notification sent',
-      result: pushResult 
+      message: `Test notification sent to ${devicesResult.rows.length} device(s)`,
+      results: results
     });
     
   } catch (error) {

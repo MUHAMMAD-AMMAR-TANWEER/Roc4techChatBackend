@@ -287,7 +287,7 @@ module.exports = (io, pool) => {
 
     // Handle sending messages
     socket.on('send_message', async (data) => {
-      try {
+    try {
         const { 
           roomId, 
           messageText, 
@@ -435,7 +435,7 @@ module.exports = (io, pool) => {
 
                 // SYNC TO ODOO (non-blocking)
 
-                      syncMessageToOdoo({
+         syncMessageToOdoo({
           id: fullMessage.id,
           room_id: room.internal_task_id,
           sender_id: socket.userId,
@@ -457,18 +457,17 @@ module.exports = (io, pool) => {
         console.log("Going to push notifications: ")
         
         // Get room participants for push notifications
-      const participantsResult = await pool.query(`
-          SELECT 
-            u.id, 
-            u.fcm_token, 
-            u.username, 
-            u.full_name,
-            u.is_online,
-            u.user_type
-          FROM chat_rooms cr
-          JOIN users u ON (u.id = cr.client_id OR u.id = cr.technician_id)
-          WHERE cr.id = $1 AND u.id != $2
-        `, [roomId, socket.userId]);
+          const participantsResult = await pool.query(`
+            SELECT 
+              u.id, 
+              u.username, 
+              u.full_name,
+              u.is_online,
+              u.user_type
+            FROM chat_rooms cr
+            JOIN users u ON (u.id = cr.client_id OR u.id = cr.technician_id)
+            WHERE cr.id = $1 AND u.id != $2
+          `, [roomId, socket.userId]);
       
         console.log(`[PUSH] Found ${participantsResult.rows.length} participant(s)`);
         console.log(participantsResult.rows)
@@ -476,37 +475,60 @@ module.exports = (io, pool) => {
         // Send push notifications to offline users
         for (const participant of participantsResult.rows) {
           console.log()
-          if (!participant.is_online && participant.fcm_token) {
+          if (!participant.is_online) {
+            try {
+
+
+                         const devicesResult = await pool.query(`
+                      SELECT id, fcm_token, device_name, device_type
+                      FROM user_devices
+                      WHERE user_id = $1 AND is_active = true AND fcm_token IS NOT NULL
+                    `, [participant.id]);
+                        
+                    console.log(`[PUSH] User ${participant.username} has ${devicesResult.rows.length} active device(s)`);
+                        
+                    if (devicesResult.rows.length === 0) {
+                      console.log(`[PUSH] ⚠️ User ${participant.username} has no active devices`);
+                      continue;
+                    }
+              for (const device of devicesResult.rows) {
             try {
               const notificationTitle = `💬 ${socket.user.full_name || socket.user.username}`;
               const notificationBody = quotedMessageId 
                 ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
                 : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
-                console.log("we are getting to push notifications.")
-                console.log(     participant.fcm_token,
-                                notificationTitle,
-                                notificationBody,)
-              const result = await sendPushNotification(
-                                participant.fcm_token,
-                                notificationTitle,
-                                notificationBody,
-                                { 
-                                  roomId: String(roomId), 
-                                  messageId: String(message.id),
-                                  type: 'new_message',
-                                  senderName: socket.user.username,
-                                  senderId: String(socket.userId)
-                                }
-                                );
 
-                  if (result && result.shouldRemoveToken) {
-                                         await pool.query(
-                                            'UPDATE users SET fcm_token = NULL WHERE id = $1',
-                                                    [participant.id]
-                                                 );
-                                      console.log(`🗑️ Removed invalid FCM token for user ${participant.username}`);
-                                         }
-              
+              console.log(`[PUSH] 📤 Sending to device: ${device.device_name || 'Unknown'} (${device.device_type || 'unknown'})`);
+
+              const result = await sendPushNotification(
+                device.fcm_token,
+                notificationTitle,
+                notificationBody,
+                { 
+                  roomId: String(roomId), 
+                  messageId: String(message.id),
+                  type: 'new_message',
+                  senderName: socket.user.username,
+                  senderId: String(socket.userId)
+                }
+              );
+
+              // If token is invalid, mark THIS device as inactive
+              if (result && result.shouldRemoveToken) {
+                await pool.query(
+                  'UPDATE user_devices SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+                  [device.id]
+                );
+                console.log(`🗑️ Marked device ${device.device_name || device.id} as inactive for user ${participant.username}`);
+              } else {
+                console.log(`[PUSH] ✅ Sent to ${device.device_name || 'device'}`);
+              }
+
+            } catch (deviceError) {
+              console.error(`[PUSH] ❌ Failed to send to device ${device.device_name || device.id}:`, deviceError.message);
+              // Continue to next device even if one fails
+            }
+          }
                 /** 
               await sendPushNotification(
                 participant.fcm_token,

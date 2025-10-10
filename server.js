@@ -143,5 +143,22 @@ if (process.env.NODE_ENV === 'production') {
     process.exit(1);
   });
 }
+// Clean up inactive devices older than 90 days
+
+setInterval(async () => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM user_devices
+      WHERE is_active = false 
+      AND updated_at < NOW() - INTERVAL '90 days'
+    `);
+    
+    if (result.rowCount > 0) {
+      console.log(`🧹 Cleaned up ${result.rowCount} old inactive devices`);
+    }
+  } catch (error) {
+    console.error('Error cleaning up devices:', error);
+  }
+}, 24 * 60 * 60 * 1000);  // Run daily
 
 module.exports = { app, server, pool };
