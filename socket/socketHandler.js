@@ -1,12 +1,70 @@
 
 const { sendPushNotification } = require('../services/pushNotification');
 const axios = require('axios');
+const https = require('https');
+
+
+const axiosInstance = axios.create({
+  httpsAgent: new https.Agent({  
+    rejectUnauthorized: false
+  })
+});
 
 const ODOO_SYNC_CONFIG = {
   enabled: true,
-  apiUrl: 'https://roc4.live/api/chat/sync_message',
-  timeout: 5000
+  apiUrl: 'http://127.0.0.1:8069/api/chat/sync_message',
+  timeout: 10000
 };
+
+// ✅ Session management
+let odooSession = null;
+
+async function createOdooSession() {
+  try {
+    console.log('[ODOO] Creating session...');
+    
+    const response = await axios.post(
+      'http://127.0.0.1:8069/web/session/authenticate',
+      {
+        jsonrpc: "2.0",
+        params: {
+          db: "Mobile_api",
+          login: "merac",
+          password: "123"
+        }
+      },
+      {
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    // Extract session from Set-Cookie header
+    if (response.headers['set-cookie']) {
+      const sessionCookie = response.headers['set-cookie']
+        .find(cookie => cookie.startsWith('session_id='));
+      
+      if (sessionCookie) {
+        odooSession = sessionCookie.split(';')[0]; // Get just "session_id=xxx"
+        console.log('[ODOO] ✅ Session created');
+        return true;
+      }
+    }
+    
+    console.error('[ODOO] ❌ No session cookie received');
+    return false;
+  } catch (error) {
+    console.error('[ODOO] ❌ Session creation failed:', error.message);
+    return false;
+  }
+}
+
+// Create session when server starts
+createOdooSession();
+
+// Recreate session every 30 minutes (sessions can expire)
+setInterval(createOdooSession, 30 * 60 * 1000);
+
+
 
 
 async function syncMessageToOdoo(messageData, pool) {
@@ -15,38 +73,51 @@ async function syncMessageToOdoo(messageData, pool) {
     return false;
   }
 
+  if (!odooSession) {
+    await createOdooSession();
+  }
+
   try {
     const payload = {
-      internal_task_id: messageData.room_id,
-      sender_internal_id: messageData.sender_internal_id,
-      receiver_internal_id: messageData.receiver_internal_id,
-      message_text: messageData.message_text,
+      internal_task_id: parseInt(messageData.room_id),  // ✅ Convert to number
+      sender_internal_id: parseInt(messageData.sender_internal_id),  // ✅ Convert to number
+      receiver_internal_id: parseInt(messageData.receiver_internal_id),  // ✅ Convert to number
+      message_text: messageData.message_text || "File",
       message_type: messageData.message_type,
       timestamp: messageData.created_at,
       message_id: messageData.id,
       sender_name: messageData.sender_name,
       sender_type: messageData.sender_type,
       quoted_message_text: messageData.quoted_message_text,
-      quoted_sender_name: messageData.quoted_sender_name
+      quoted_sender_name: messageData.quoted_sender_name,
+      file_url: messageData.file_url
     };
 
-    console.log('[ODOO SYNC] 📤 Syncing:', {
-      message_id: payload.message_id,
-      task_id: payload.internal_task_id,
-      sender: payload.sender_name
-    });
+    console.log("here is the message data ", messageData)
 
-    const response = await axios.post(
+    console.log('[ODOO SYNC] 📤 Syncing:', payload);
+    
+    console.log('[ODOO SYNC] 🔗 Calling URL:', ODOO_SYNC_CONFIG.apiUrl);
+
+    const response = await axiosInstance.post(
       ODOO_SYNC_CONFIG.apiUrl,
       payload,
       {
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Cookie': odooSession
+        },
         timeout: ODOO_SYNC_CONFIG.timeout
       }
     );
 
-    if (response.data.success) {
-      console.log('[ODOO SYNC] ✅ Synced successfully');
+    console.log('[ODOO SYNC] 📥 Response:', response.status, response.statusText);
+
+    // Handle JSON-RPC response format
+    const result = response.data.result || response.data;
+    
+    if (result.success) {
+      console.log('[ODOO SYNC] ✅ Synced successfully to task', result.task_id);
       
       await pool.query(
         'UPDATE messages SET synced_to_odoo = true, synced_at = CURRENT_TIMESTAMP WHERE id = $1',
@@ -55,20 +126,33 @@ async function syncMessageToOdoo(messageData, pool) {
       
       return true;
     } else {
-      console.error('[ODOO SYNC] ❌ Failed:', response.data.error);
+      console.error('[ODOO SYNC] ❌ Sync failed:', result.error || 'Unknown error');
       return false;
     }
   } catch (error) {
-    if (error.code === 'ECONNABORTED') {
-      console.error('[ODOO SYNC] ❌ Timeout');
-    } else if (error.code === 'ECONNREFUSED') {
-      console.error('[ODOO SYNC] ❌ Connection refused');
+    if (error.response) {
+      // Server responded with error status
+      console.error('[ODOO SYNC] ❌ HTTP Error:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        url: ODOO_SYNC_CONFIG.apiUrl,
+        data: JSON.stringify(error.response.data).substring(0, 200)
+      });
+    } else if (error.request) {
+      // No response received
+      console.error('[ODOO SYNC] ❌ Network Error:', {
+        message: error.message,
+        code: error.code,
+        url: ODOO_SYNC_CONFIG.apiUrl
+      });
     } else {
+      // Request setup error
       console.error('[ODOO SYNC] ❌ Error:', error.message);
     }
     return false;
   }
 }
+
 
 
 module.exports = (io, pool) => {
@@ -280,6 +364,19 @@ module.exports = (io, pool) => {
           quotedSenderName = quotedResult.rows[0].full_name;
         }
 
+        console.log("Debugging values: ",roomId, 
+          socket.userId, 
+          senderInternalId,
+          receiverChatId,
+          receiverInternalId,
+          messageText, 
+          messageType, 
+          fileUrl, 
+          fileName, 
+          fileSize, 
+          quotedMessageId,
+          quotedMessageText,
+          quotedSenderName)
 
         // Insert message (trigger will populate quoted message details automatically)
         const messageResult = await pool.query(`
@@ -337,7 +434,8 @@ module.exports = (io, pool) => {
         io.to(`room_${roomId}`).emit('new_message', fullMessage);
 
                 // SYNC TO ODOO (non-blocking)
-        syncMessageToOdoo({
+
+                      syncMessageToOdoo({
           id: fullMessage.id,
           room_id: room.internal_task_id,
           sender_id: socket.userId,
@@ -350,27 +448,44 @@ module.exports = (io, pool) => {
           sender_type: socket.user.user_type,
           quoted_message_text: quotedMessageText,
           quoted_sender_name: quotedSenderName,
-          created_at: fullMessage.created_at
+          created_at: fullMessage.created_at,
+          file_url:fileUrl
         }, pool).catch(err => {
           console.error('[ODOO SYNC] Failed but continuing:', err.message);
         });
         
+        console.log("Going to push notifications: ")
+        
         // Get room participants for push notifications
-        const participantsResult = await pool.query(`
-          SELECT u.id, u.fcm_token, u.username, u.is_online 
+      const participantsResult = await pool.query(`
+          SELECT 
+            u.id, 
+            u.fcm_token, 
+            u.username, 
+            u.full_name,
+            u.is_online,
+            u.user_type
           FROM chat_rooms cr
           JOIN users u ON (u.id = cr.client_id OR u.id = cr.technician_id)
           WHERE cr.id = $1 AND u.id != $2
         `, [roomId, socket.userId]);
+      
+        console.log(`[PUSH] Found ${participantsResult.rows.length} participant(s)`);
+        console.log(participantsResult.rows)
         
         // Send push notifications to offline users
         for (const participant of participantsResult.rows) {
+          console.log()
           if (!participant.is_online && participant.fcm_token) {
             try {
               const notificationTitle = `💬 ${socket.user.full_name || socket.user.username}`;
               const notificationBody = quotedMessageId 
                 ? `💬 ${messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file')}`
                 : messageText || (messageType === 'image' ? 'Sent an image' : 'Sent a file');
+                console.log("we are getting to push notifications.")
+                console.log(     participant.fcm_token,
+                                notificationTitle,
+                                notificationBody,)
               const result = await sendPushNotification(
                                 participant.fcm_token,
                                 notificationTitle,
@@ -404,6 +519,7 @@ module.exports = (io, pool) => {
                   senderName: socket.user.username
                 }
               ); */
+
             } catch (notificationError) {
               console.error(`Failed to send notification to ${participant.username}:`, notificationError);
             }
