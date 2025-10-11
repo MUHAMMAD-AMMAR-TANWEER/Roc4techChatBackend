@@ -579,12 +579,14 @@ router.get('/tasks/:internal_task_id', async (req, res) => {
 });
 
 // Create or get chat room using internal IDs
+// ========== 🔧 UPDATED: Fully backward compatible room creation ==========
 router.post('/rooms/create', async (req, res) => {
   try {
     const {
       client_internal_id,
       technician_internal_id,
-      task_internal_id
+      task_internal_id,
+      additional_participants = []  // 🆕 OPTIONAL - Mobile doesn't need to send this
     } = req.body;
 
     const pool = getPool(req);
@@ -595,70 +597,42 @@ router.post('/rooms/create', async (req, res) => {
       });
     }
 
-    // 🐛 DEBUG: Log what we're looking for
-    console.log('Looking for client with internal_user_id:', client_internal_id, typeof client_internal_id);
-    console.log('Looking for technician with internal_user_id:', technician_internal_id, typeof technician_internal_id);
-    console.log('Looking for task with internal_task_id:', task_internal_id, typeof task_internal_id);
+    console.log('Looking for client with internal_user_id:', client_internal_id);
+    console.log('Looking for technician with internal_user_id:', technician_internal_id);
 
-    // Get internal IDs converted to our database IDs
+    // Get client
     const clientResult = await pool.query(
-      'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1 AND user_type = $2 AND is_active = true',
-      [Number(client_internal_id), 'client']
+      'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1 AND is_active = true',
+      [Number(client_internal_id)]
     );
 
-    // 🐛 DEBUG: Log what we found
-    console.log('Client query result:', clientResult.rows);
-
+    // Get technician
     const techResult = await pool.query(
-      'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1 AND user_type = $2 AND is_active = true',
-      [Number(technician_internal_id), 'technician']
+      'SELECT id, username, full_name, internal_user_id FROM users WHERE internal_user_id = $1 AND is_active = true',
+      [Number(technician_internal_id)]
     );
 
-    // 🐛 DEBUG: Log what we found
-    console.log('Technician query result:', techResult.rows);
-
+    // Get task
     const taskResult = await pool.query(
       'SELECT id, task_name FROM tasks WHERE internal_task_id = $1',
       [task_internal_id]
     );
 
-    // 🐛 DEBUG: Log what we found
-    console.log('Task query result:', taskResult.rows);
-
     if (clientResult.rows.length === 0) {
-      // 🐛 Better error message
-      return res.status(404).json({ 
-        error: 'Client not found or not active',
-        debug: {
-          searched_for: client_internal_id,
-          type: typeof client_internal_id
-        }
-      });
+      return res.status(404).json({ error: 'Client not found or not active' });
     }
     if (techResult.rows.length === 0) {
-      return res.status(404).json({ 
-        error: 'Technician not found or not active',
-        debug: {
-          searched_for: technician_internal_id,
-          type: typeof technician_internal_id
-        }
-      });
+      return res.status(404).json({ error: 'Technician not found or not active' });
     }
     if (taskResult.rows.length === 0) {
-      return res.status(404).json({ 
-        error: 'Task not found',
-        debug: {
-          searched_for: task_internal_id,
-          type: typeof task_internal_id
-        }
-      });
+      return res.status(404).json({ error: 'Task not found' });
     }
 
     const clientId = clientResult.rows[0].id;
     const technicianId = techResult.rows[0].id;
     const taskId = taskResult.rows[0].id;
 
-    // Create or get existing room
+    // ✅ SAME AS BEFORE - Mobile compatibility maintained
     const roomResult = await pool.query(`
       INSERT INTO chat_rooms (client_id, technician_id, task_id, room_name, updated_at)
       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
@@ -669,7 +643,39 @@ router.post('/rooms/create', async (req, res) => {
       RETURNING *
     `, [clientId, technicianId, taskId, `${taskResult.rows[0].task_name} - ${clientResult.rows[0].username} & ${techResult.rows[0].username}`]);
 
-    // Get room with user and task details
+    const room = roomResult.rows[0];
+
+    // 🆕 NEW: Add additional participants (if any) - Mobile doesn't send this, only Odoo does
+    if (additional_participants && additional_participants.length > 0) {
+      for (const internal_user_id of additional_participants) {
+        try {
+          // Get user's chat ID
+          const userResult = await pool.query(
+            'SELECT id FROM users WHERE internal_user_id = $1 AND is_active = true',
+            [Number(internal_user_id)]
+          );
+          
+          if (userResult.rows.length > 0) {
+            const userId = userResult.rows[0].id;
+            
+            // Don't add if already client or technician
+            if (userId !== clientId && userId !== technicianId) {
+              await pool.query(`
+                INSERT INTO room_participants (room_id, user_id, role)
+                VALUES ($1, $2, 'admin')
+                ON CONFLICT (room_id, user_id) DO UPDATE SET is_active = true
+              `, [room.id, userId]);
+              
+              console.log(`[ROOM] Added additional participant: ${internal_user_id}`);
+            }
+          }
+        } catch (err) {
+          console.error(`[ROOM] Failed to add participant ${internal_user_id}:`, err);
+        }
+      }
+    }
+
+    // ✅ SAME RESPONSE FORMAT - Mobile compatibility maintained
     const roomDetailsResult = await pool.query(`
       SELECT 
         cr.*,
@@ -686,7 +692,7 @@ router.post('/rooms/create', async (req, res) => {
       JOIN users tech ON cr.technician_id = tech.id
       JOIN tasks t ON cr.task_id = t.id
       WHERE cr.id = $1
-    `, [roomResult.rows[0].id]);
+    `, [room.id]);
 
     res.json({
       success: true,
@@ -794,63 +800,85 @@ router.get('/rooms/user', async (req, res) => {
     // Get chat rooms based on user type
     let roomsQuery = '';
     if (user_type === 'client') {
-      roomsQuery = `
-        SELECT 
-          cr.*,
-          tech.username as other_user_username,
-          tech.full_name as other_user_name,
-          tech.internal_user_id as other_user_internal_id,
-          tech.avatar_url as other_user_avatar,
-          tech.is_online as other_user_online,
-          t.task_name,
-          t.internal_task_id,
-          latest_msg.message_text as last_message,
-          latest_msg.message_type as last_message_type,
-          latest_msg.created_at as last_message_time,
-          latest_msg.sender_id as last_message_sender_id,
-          (SELECT COUNT(*) FROM messages WHERE room_id = cr.id AND sender_id != $1 AND is_read = false) as unread_count
-        FROM chat_rooms cr
-        JOIN users tech ON cr.technician_id = tech.id
-        JOIN tasks t ON cr.task_id = t.id
-        LEFT JOIN LATERAL (
-          SELECT message_text, message_type, created_at, sender_id
-          FROM messages 
-          WHERE room_id = cr.id 
-          ORDER BY created_at DESC 
-          LIMIT 1
-        ) latest_msg ON true
-        WHERE cr.client_id = $1 AND cr.is_active = true
-        ORDER BY COALESCE(cr.last_message_at, cr.created_at) DESC
-      `;
+ roomsQuery = `
+  SELECT 
+    cr.*,
+    tech.username as other_user_username,
+    tech.full_name as other_user_name,
+    tech.internal_user_id as other_user_internal_id,
+    tech.avatar_url as other_user_avatar,
+    tech.is_online as other_user_online,
+    t.task_name,
+    t.internal_task_id,
+    latest_msg.message_text as last_message,
+    latest_msg.message_type as last_message_type,
+    latest_msg.created_at as last_message_time,
+    latest_msg.sender_id as last_message_sender_id,
+    (SELECT COUNT(*) FROM messages WHERE room_id = cr.id AND sender_id != $1 AND is_read = false) as unread_count
+  FROM chat_rooms cr
+  JOIN users client ON cr.client_id = client.id
+  JOIN users tech ON cr.technician_id = tech.id
+  JOIN tasks t ON cr.task_id = t.id
+  LEFT JOIN LATERAL (
+    SELECT message_text, message_type, created_at, sender_id
+    FROM messages 
+    WHERE room_id = cr.id 
+    ORDER BY created_at DESC 
+    LIMIT 1
+  ) latest_msg ON true
+  WHERE (
+    cr.client_id = $1 
+    OR cr.technician_id = $1
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $1 
+      AND rp.is_active = true
+    )
+  ) 
+  AND cr.is_active = true
+  ORDER BY COALESCE(cr.last_message_at, cr.created_at) DESC
+`;
     } else { // technician
       roomsQuery = `
-        SELECT 
-          cr.*,
-          client.username as other_user_username,
-          client.full_name as other_user_name,
-          client.internal_user_id as other_user_internal_id,
-          client.avatar_url as other_user_avatar,
-          client.is_online as other_user_online,
-          t.task_name,
-          t.internal_task_id,
-          latest_msg.message_text as last_message,
-          latest_msg.message_type as last_message_type,
-          latest_msg.created_at as last_message_time,
-          latest_msg.sender_id as last_message_sender_id,
-          (SELECT COUNT(*) FROM messages WHERE room_id = cr.id AND sender_id != $1 AND is_read = false) as unread_count
-        FROM chat_rooms cr
-        JOIN users client ON cr.client_id = client.id
-        JOIN tasks t ON cr.task_id = t.id
-        LEFT JOIN LATERAL (
-          SELECT message_text, message_type, created_at, sender_id
-          FROM messages 
-          WHERE room_id = cr.id 
-          ORDER BY created_at DESC 
-          LIMIT 1
-        ) latest_msg ON true
-        WHERE cr.technician_id = $1 AND cr.is_active = true
-        ORDER BY COALESCE(cr.last_message_at, cr.created_at) DESC
-      `;
+  SELECT 
+    cr.*,
+    tech.username as other_user_username,
+    tech.full_name as other_user_name,
+    tech.internal_user_id as other_user_internal_id,
+    tech.avatar_url as other_user_avatar,
+    tech.is_online as other_user_online,
+    t.task_name,
+    t.internal_task_id,
+    latest_msg.message_text as last_message,
+    latest_msg.message_type as last_message_type,
+    latest_msg.created_at as last_message_time,
+    latest_msg.sender_id as last_message_sender_id,
+    (SELECT COUNT(*) FROM messages WHERE room_id = cr.id AND sender_id != $1 AND is_read = false) as unread_count
+  FROM chat_rooms cr
+  JOIN users client ON cr.client_id = client.id
+  JOIN users tech ON cr.technician_id = tech.id
+  JOIN tasks t ON cr.task_id = t.id
+  LEFT JOIN LATERAL (
+    SELECT message_text, message_type, created_at, sender_id
+    FROM messages 
+    WHERE room_id = cr.id 
+    ORDER BY created_at DESC 
+    LIMIT 1
+  ) latest_msg ON true
+  WHERE (
+    cr.client_id = $1 
+    OR cr.technician_id = $1
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $1 
+      AND rp.is_active = true
+    )
+  ) 
+  AND cr.is_active = true
+  ORDER BY COALESCE(cr.last_message_at, cr.created_at) DESC
+`;
     }
 
     const roomsResult = await pool.query(roomsQuery, [userId]);
@@ -1265,5 +1293,280 @@ router.get('/search', requireClientOrTechnician, async (req, res) => {
     res.status(500).json({ error: 'Search failed' });
   }
 });
+
+
+router.post('/rooms/:roomId/participants/add', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { internal_user_id, role = 'observer' } = req.body;
+    
+    const pool = getPool(req);
+
+    if (!internal_user_id) {
+      return res.status(400).json({ error: 'internal_user_id is required' });
+    }
+
+    // Verify room exists
+    const roomCheck = await pool.query(
+      'SELECT id, room_name FROM chat_rooms WHERE id = $1',
+      [roomId]
+    );
+
+    if (roomCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id, username, full_name, user_type FROM users WHERE internal_user_id = $1 AND is_active = true',
+      [Number(internal_user_id)]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found or inactive' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Check if already a primary participant (client or technician)
+    const isPrimaryCheck = await pool.query(
+      'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
+      [roomId, user.id]
+    );
+
+    if (isPrimaryCheck.rows.length > 0) {
+      return res.status(400).json({ 
+        error: 'User is already a primary participant (client or technician) in this room' 
+      });
+    }
+
+    // Add participant
+    await pool.query(`
+      INSERT INTO room_participants (room_id, user_id, role)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (room_id, user_id) 
+      DO UPDATE SET is_active = true, role = EXCLUDED.role
+    `, [roomId, user.id, role]);
+
+    console.log(`[ROOM] ✅ Added ${user.username} to room ${roomId}`);
+
+    // Get updated participant list
+    const participantsResult = await pool.query(`
+      SELECT 
+        u.id,
+        u.internal_user_id,
+        u.username,
+        u.full_name,
+        u.user_type,
+        rp.role,
+        rp.joined_at
+      FROM room_participants rp
+      JOIN users u ON rp.user_id = u.id
+      WHERE rp.room_id = $1 AND rp.is_active = true
+    `, [roomId]);
+
+    // Notify the added user
+    const { sendPushNotification } = require('../services/pushNotification');
+    const devicesResult = await pool.query(
+      'SELECT fcm_token, device_name FROM user_devices WHERE user_id = $1 AND is_active = true',
+      [user.id]
+    );
+
+    for (const device of devicesResult.rows) {
+      try {
+        await sendPushNotification(
+          device.fcm_token,
+          '💬 Added to Chat',
+          `You've been added to: ${roomCheck.rows[0].room_name}`,
+          { 
+            roomId: String(roomId), 
+            type: 'added_to_room',
+            action: 'open_room'
+          }
+        );
+      } catch (err) {
+        console.error('[ROOM] Notification failed:', err);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${user.username} added to room successfully`,
+      room_id: roomId,
+      added_user: {
+        internal_user_id: user.internal_user_id,
+        username: user.username,
+        full_name: user.full_name,
+        role: role
+      },
+      total_additional_participants: participantsResult.rows.length
+    });
+
+  } catch (error) {
+    console.error('[ROOM] Error adding participant:', error);
+    res.status(500).json({ error: 'Failed to add participant' });
+  }
+});
+
+// ========== 🆕 Remove participant from room ==========
+router.delete('/rooms/:roomId/participants/:internal_user_id', async (req, res) => {
+  try {
+    const { roomId, internal_user_id } = req.params;
+    const pool = getPool(req);
+
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id, username FROM users WHERE internal_user_id = $1',
+      [Number(internal_user_id)]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Check if user is primary participant
+    const isPrimaryCheck = await pool.query(
+      'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
+      [roomId, user.id]
+    );
+
+    if (isPrimaryCheck.rows.length > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot remove primary participants (client or technician). Deactivate the room instead.' 
+      });
+    }
+
+    // Remove participant (soft delete)
+    const result = await pool.query(`
+      UPDATE room_participants 
+      SET is_active = false 
+      WHERE room_id = $1 AND user_id = $2
+      RETURNING *
+    `, [roomId, user.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        error: 'User is not an additional participant in this room' 
+      });
+    }
+
+    console.log(`[ROOM] ✅ Removed ${user.username} from room ${roomId}`);
+
+    res.json({
+      success: true,
+      message: `${user.username} removed from room successfully`,
+      room_id: roomId,
+      removed_user: {
+        internal_user_id: internal_user_id,
+        username: user.username
+      }
+    });
+
+  } catch (error) {
+    console.error('[ROOM] Error removing participant:', error);
+    res.status(500).json({ error: 'Failed to remove participant' });
+  }
+});
+
+// ========== 🆕 Get all participants in a room ==========
+router.get('/rooms/:roomId/participants', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const pool = getPool(req);
+
+    // Verify room exists and get primary participants
+    const roomResult = await pool.query(`
+      SELECT 
+        cr.id,
+        cr.room_name,
+        cr.client_id,
+        cr.technician_id,
+        client.internal_user_id as client_internal_id,
+        client.username as client_username,
+        client.full_name as client_name,
+        client.user_type as client_type,
+        tech.internal_user_id as tech_internal_id,
+        tech.username as tech_username,
+        tech.full_name as tech_name,
+        tech.user_type as tech_type
+      FROM chat_rooms cr
+      JOIN users client ON cr.client_id = client.id
+      JOIN users tech ON cr.technician_id = tech.id
+      WHERE cr.id = $1
+    `, [roomId]);
+
+    if (roomResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    const room = roomResult.rows[0];
+
+    // Get additional participants
+    const additionalResult = await pool.query(`
+      SELECT 
+        u.id,
+        u.internal_user_id,
+        u.username,
+        u.full_name,
+        u.user_type,
+        rp.role,
+        rp.joined_at
+      FROM room_participants rp
+      JOIN users u ON rp.user_id = u.id
+      WHERE rp.room_id = $1 AND rp.is_active = true
+      ORDER BY rp.joined_at ASC
+    `, [roomId]);
+
+    // Build response
+    const primaryParticipants = [
+      {
+        id: room.client_id,
+        internal_user_id: room.client_internal_id,
+        username: room.client_username,
+        full_name: room.client_name,
+        user_type: room.client_type,
+        role: 'client',
+        is_primary: true
+      },
+      {
+        id: room.technician_id,
+        internal_user_id: room.tech_internal_id,
+        username: room.tech_username,
+        full_name: room.tech_name,
+        user_type: room.tech_type,
+        role: 'technician',
+        is_primary: true
+      }
+    ];
+
+    const additionalParticipants = additionalResult.rows.map(p => ({
+      id: p.id,
+      internal_user_id: p.internal_user_id,
+      username: p.username,
+      full_name: p.full_name,
+      user_type: p.user_type,
+      role: p.role,
+      joined_at: p.joined_at,
+      is_primary: false
+    }));
+
+    res.json({
+      success: true,
+      room_id: roomId,
+      room_name: room.room_name,
+      total_participants: primaryParticipants.length + additionalParticipants.length,
+      primary_participants: primaryParticipants,
+      additional_participants: additionalParticipants,
+      all_participants: [...primaryParticipants, ...additionalParticipants]
+    });
+
+  } catch (error) {
+    console.error('[ROOM] Error getting participants:', error);
+    res.status(500).json({ error: 'Failed to get participants' });
+  }
+});
+
 
 module.exports = router;

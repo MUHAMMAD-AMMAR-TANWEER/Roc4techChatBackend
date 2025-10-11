@@ -225,10 +225,21 @@ module.exports = (io, pool) => {
         }
 
         // Verify user has access to this room
-        const accessCheck = await pool.query(
-          'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
-          [roomId, socket.userId]
-        );
+        const accessCheck = await pool.query(`
+  SELECT cr.id 
+  FROM chat_rooms cr
+  WHERE cr.id = $1 
+  AND (
+    cr.client_id = $2 
+    OR cr.technician_id = $2 
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $2 
+      AND rp.is_active = true
+    )
+  )
+`, [roomId, socket.userId]);
 
         console.log(`🔍 Access check result: ${accessCheck.rows.length} rows found`);
 
@@ -287,6 +298,7 @@ module.exports = (io, pool) => {
 
     // Handle sending messages
     socket.on('send_message', async (data) => {
+      
     try {
         const { 
           roomId, 
@@ -303,38 +315,71 @@ module.exports = (io, pool) => {
         }
 
         // Verify user has access to this room
-        const accessCheck = await pool.query(`
-          SELECT 
-            cr.id,
-            cr.client_id,
-            cr.technician_id,
-            cr.task_id,
-            client.internal_user_id as client_internal_id,
-            tech.internal_user_id as technician_internal_id,
-            t.internal_task_id
-          FROM chat_rooms cr
-          JOIN users client ON cr.client_id = client.id
-          JOIN users tech ON cr.technician_id = tech.id
-          JOIN tasks t ON cr.task_id = t.id
-          WHERE cr.id = $1 AND (cr.client_id = $2 OR cr.technician_id = $2)
-        `, [roomId, socket.userId]);
+     const accessCheck = await pool.query(`
+  SELECT 
+    cr.id,
+    cr.client_id,
+    cr.technician_id,
+    cr.task_id,
+    client.internal_user_id as client_internal_id,
+    tech.internal_user_id as technician_internal_id,
+    t.internal_task_id
+  FROM chat_rooms cr
+  JOIN users client ON cr.client_id = client.id
+  JOIN users tech ON cr.technician_id = tech.id
+  JOIN tasks t ON cr.task_id = t.id
+  WHERE cr.id = $1 
+  AND (
+    cr.client_id = $2 
+    OR cr.technician_id = $2
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $2 
+      AND rp.is_active = true
+    )
+  )
+`, [roomId, socket.userId]);
 
-        if (accessCheck.rows.length === 0) {
-          return socket.emit('error', { message: 'Access denied to this room' });
-        }
-
+if (accessCheck.rows.length === 0) {
+  return socket.emit('error', { message: 'Access denied to this room' });
+}
         const room = accessCheck.rows[0];
 
+        console.log('[DEBUG] Room data retrieved:', {
+  room_id: room.id,
+  client_id: room.client_id,
+  technician_id: room.technician_id,
+  task_id: room.task_id,
+  internal_task_id: room.internal_task_id
+});
 
-        // Extract internal IDs from room
+        // Extract sender internal ID
         const senderInternalId = socket.user.internal_user_id;
-        const receiverChatId = room.client_id === socket.userId 
-          ? room.technician_id 
-          : room.client_id;
-        
-        const receiverInternalId = room.client_id === socket.userId
-          ? room.technician_internal_id
-          : room.client_internal_id;
+        console.log("here is sender id ::: ", senderInternalId)
+
+        // ========== 🔧 FIX: Determine receiver for group chats ==========
+        let receiverChatId;
+        let receiverInternalId;
+
+        // Check if sender is one of the primary participants
+        if (socket.userId === room.client_id) {
+          // Sender is client → receiver is technician
+          receiverChatId = room.technician_id;
+          receiverInternalId = room.technician_internal_id;
+        } else if (socket.userId === room.technician_id) {
+          // Sender is technician → receiver is client
+          receiverChatId = room.client_id;
+          receiverInternalId = room.client_internal_id;
+        } else {
+          // 🆕 Sender is additional participant (admin/observer)
+          // In group chats, we'll use client as "receiver" for database consistency
+          // But the message will be broadcast to ALL participants anyway
+          receiverChatId = room.client_id;
+          receiverInternalId = room.client_internal_id;
+
+          console.log(`[MESSAGE] Additional participant ${socket.user.username} sending message (receiver set to client for DB)`);
+        }
 
         console.log('[MESSAGE] 📝 IDs:', {
           sender_chat_id: socket.userId,
@@ -343,7 +388,6 @@ module.exports = (io, pool) => {
           receiver_internal_id: receiverInternalId,
           task_internal_id: room.internal_task_id
         });
-
         // Validate quoted message if provided
         let quotedMessageText = null;
         let quotedSenderName = null;
@@ -455,19 +499,27 @@ module.exports = (io, pool) => {
         });
         
         console.log("Going to push notifications: ")
-        
-        // Get room participants for push notifications
-          const participantsResult = await pool.query(`
-            SELECT 
-              u.id, 
-              u.username, 
-              u.full_name,
-              u.is_online,
-              u.user_type
-            FROM chat_rooms cr
-            JOIN users u ON (u.id = cr.client_id OR u.id = cr.technician_id)
-            WHERE cr.id = $1 AND u.id != $2
-          `, [roomId, socket.userId]);
+
+                // Get room participants for push notifications
+        const participantsResult = await pool.query(`
+          SELECT DISTINCT
+            u.id, 
+            u.username, 
+            u.full_name,
+            u.is_online,
+            u.user_type
+          FROM (
+            -- Original 2 participants (client & technician)
+            SELECT client_id as user_id FROM chat_rooms WHERE id = $1
+            UNION
+            SELECT technician_id as user_id FROM chat_rooms WHERE id = $1
+            UNION
+            -- 🆕 NEW: Additional participants
+            SELECT user_id FROM room_participants WHERE room_id = $1 AND is_active = true
+          ) participants
+          JOIN users u ON participants.user_id = u.id
+          WHERE u.id != $2 AND u.is_active = true
+        `, [roomId, socket.userId]);
       
         console.log(`[PUSH] Found ${participantsResult.rows.length} participant(s)`);
         console.log(participantsResult.rows)
@@ -566,10 +618,21 @@ module.exports = (io, pool) => {
         }
 
         // Verify access to room
-        const accessCheck = await pool.query(
-          'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
-          [roomId, socket.userId]
-        );
+        const accessCheck = await pool.query(`
+  SELECT cr.id 
+  FROM chat_rooms cr
+  WHERE cr.id = $1 
+  AND (
+    cr.client_id = $2 
+    OR cr.technician_id = $2 
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $2 
+      AND rp.is_active = true
+    )
+  )
+`, [roomId, socket.userId]);
 
         if (accessCheck.rows.length === 0) {
           return socket.emit('error', { message: 'Access denied to this room' });
@@ -630,10 +693,21 @@ module.exports = (io, pool) => {
         }
 
         // Verify user has access to this room
-        const accessCheck = await pool.query(
-          'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR technician_id = $2)',
-          [roomId, socket.userId]
-        );
+        const accessCheck = await pool.query(`
+  SELECT cr.id 
+  FROM chat_rooms cr
+  WHERE cr.id = $1 
+  AND (
+    cr.client_id = $2 
+    OR cr.technician_id = $2 
+    OR EXISTS (
+      SELECT 1 FROM room_participants rp 
+      WHERE rp.room_id = cr.id 
+      AND rp.user_id = $2 
+      AND rp.is_active = true
+    )
+  )
+`, [roomId, socket.userId]);
 
         if (accessCheck.rows.length === 0) {
           return socket.emit('error', { message: 'Access denied to this room' });
