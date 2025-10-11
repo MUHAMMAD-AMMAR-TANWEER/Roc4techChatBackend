@@ -44,6 +44,8 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
 
     console.log(`📱 Sending notification to: ${fcmToken.substring(0, 20)}...`);
 
+    console.log("Here is complete data... ",data)
+
     const message = {
       notification: {
         title: title,

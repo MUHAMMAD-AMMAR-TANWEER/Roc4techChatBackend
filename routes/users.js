@@ -814,4 +814,294 @@ router.patch('/restore/:id', async (req, res) => {
   }
 });
 
+
+
+// Send notification to user with task routing
+router.delete('/fcm/clear-all-tokens', async (req, res) => {
+  try {
+    const { confirm_secret } = req.body;
+    const pool = getPool(req);
+
+    // ========== SAFETY: Require confirmation secret ==========
+    const CLEAR_SECRET = process.env.FCM_CLEAR_SECRET || 'DELETE_ALL_TOKENS_2024';
+    
+    console.log('⚠️ [FCM-CLEAR] Starting to clear ALL FCM tokens...');
+
+    // Get counts before deletion
+    const deviceCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM user_devices'
+    );
+    const deviceCount = parseInt(deviceCountResult.rows[0].count);
+
+    const userTokenCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE fcm_token IS NOT NULL'
+    );
+    const userTokenCount = parseInt(userTokenCountResult.rows[0].count);
+
+    // ========== 🔧 FIX: DELETE rows instead of setting NULL ==========
+    await pool.query('DELETE FROM user_devices');
+
+    // Clear all tokens from users table (backward compatibility)
+    await pool.query(`
+      UPDATE users 
+      SET fcm_token = NULL, 
+          updated_at = CURRENT_TIMESTAMP
+      WHERE fcm_token IS NOT NULL
+    `);
+
+    console.log(`🗑️ [FCM-CLEAR] Deleted ${deviceCount} device records`);
+    console.log(`🗑️ [FCM-CLEAR] Cleared ${userTokenCount} user tokens`);
+
+    res.json({
+      success: true,
+      message: 'All FCM tokens cleared successfully',
+      summary: {
+        devices_deleted: deviceCount,
+        users_cleared: userTokenCount,
+        total_cleared: deviceCount + userTokenCount,
+        timestamp: new Date().toISOString()
+      },
+      note: 'Users will need to re-register their devices on next app launch'
+    });
+
+  } catch (error) {
+    console.error('[FCM-CLEAR] ❌ Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to clear FCM tokens',
+      message: error.message 
+    });
+  }
+});
+
+
+
+router.delete('/fcm/clear-all-tokens', async (req, res) => {
+  try {
+    const { confirm_secret } = req.body;
+    const pool = getPool(req);
+
+    // ========== SAFETY: Require confirmation secret ==========
+    const CLEAR_SECRET = process.env.FCM_CLEAR_SECRET || 'DELETE_ALL_TOKENS_2024';
+    
+
+
+    console.log('⚠️ [FCM-CLEAR] Starting to clear ALL FCM tokens...');
+
+    // Get counts before deletion
+    const deviceCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM user_devices WHERE fcm_token IS NOT NULL'
+    );
+    const deviceCount = parseInt(deviceCountResult.rows[0].count);
+
+    const userTokenCountResult = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE fcm_token IS NOT NULL'
+    );
+    const userTokenCount = parseInt(userTokenCountResult.rows[0].count);
+
+    // Clear all tokens from user_devices table
+    await pool.query(`
+      UPDATE user_devices 
+      SET fcm_token = NULL, 
+          is_active = false, 
+          updated_at = CURRENT_TIMESTAMP
+    `);
+
+    // Clear all tokens from users table (backward compatibility)
+    await pool.query(`
+      UPDATE users 
+      SET fcm_token = NULL, 
+          updated_at = CURRENT_TIMESTAMP
+    `);
+
+    console.log(`🗑️ [FCM-CLEAR] Cleared ${deviceCount} device tokens`);
+    console.log(`🗑️ [FCM-CLEAR] Cleared ${userTokenCount} user tokens`);
+
+    res.json({
+      success: true,
+      message: 'All FCM tokens cleared successfully',
+      summary: {
+        devices_cleared: deviceCount,
+        users_cleared: userTokenCount,
+        total_cleared: deviceCount + userTokenCount,
+        timestamp: new Date().toISOString()
+      },
+      note: 'Users will need to re-register their devices on next app launch'
+    });
+
+  } catch (error) {
+    console.error('[FCM-CLEAR] ❌ Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to clear FCM tokens',
+      message: error.message 
+    });
+  }
+});
+
+// Send notification to user with task routing
+router.post('/fcm/send-task-notification', async (req, res) => {
+  try {
+    const { 
+      internal_user_id, 
+      task_internal_id,
+      title,
+      body,
+      additional_data = {}  // Optional: any extra data you want to pass
+    } = req.body;
+    
+    const pool = getPool(req);
+
+    // Validate required fields
+    if (!internal_user_id || !task_internal_id) {
+      return res.status(400).json({ 
+        error: 'internal_user_id and task_internal_id are required' 
+      });
+    }
+
+    if (!title || !body) {
+      return res.status(400).json({ 
+        error: 'title and body are required' 
+      });
+    }
+
+    // Get user
+    const userResult = await pool.query(
+      'SELECT id, username, full_name FROM users WHERE internal_user_id = $1 AND is_active = true',
+      [internal_user_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found or inactive' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Get task details (optional - for logging/validation)
+    const taskResult = await pool.query(
+      'SELECT id, task_name FROM tasks WHERE internal_task_id = $1',
+      [task_internal_id]
+    );
+
+    const taskName = taskResult.rows.length > 0 ? taskResult.rows[0].task_name : 'Unknown Task';
+
+    // Get all active devices for this user
+    const devicesResult = await pool.query(`
+      SELECT id, fcm_token, device_name, device_type
+      FROM user_devices
+      WHERE user_id = $1 AND is_active = true AND fcm_token IS NOT NULL
+    `, [user.id]);
+
+    if (devicesResult.rows.length === 0) {
+      return res.status(404).json({ 
+        error: 'No active devices found for this user',
+        user_info: {
+          internal_user_id: internal_user_id,
+          username: user.username
+        }
+      });
+    }
+
+    console.log(`[TASK-NOTIF] 📤 Sending to user ${user.username} (${devicesResult.rows.length} devices) for task ${task_internal_id}`);
+
+    // Import push notification service
+    const { sendPushNotification } = require('../services/pushNotification');
+    
+    const results = [];
+    let successCount = 0;
+    let failedCount = 0;
+
+    // Send to ALL devices
+    for (const device of devicesResult.rows) {
+      try {
+        console.log(`[TASK-NOTIF] 📱 Sending to device: ${device.device_name || 'Unknown'} (${device.device_type || 'unknown'})`);
+
+        const notificationData = {
+          type: 'task_notification',
+          task_internal_id: String(task_internal_id),
+          task_name: taskName,
+          internal_user_id: String(internal_user_id),
+          ...additional_data  // Merge any additional data
+        };
+
+        const pushResult = await sendPushNotification(
+          device.fcm_token,
+          title,
+          body,
+          notificationData
+        );
+
+        // Handle invalid tokens
+        if (pushResult && pushResult.shouldRemoveToken) {
+          await pool.query(
+            'UPDATE user_devices SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+            [device.id]
+          );
+          
+          results.push({
+            device_id: device.id,
+            device_name: device.device_name || 'Unknown',
+            device_type: device.device_type,
+            status: 'failed',
+            reason: 'Invalid FCM token - device marked as inactive'
+          });
+          
+          failedCount++;
+          console.log(`[TASK-NOTIF] 🗑️ Marked device ${device.device_name || device.id} as inactive`);
+        } else {
+          results.push({
+            device_id: device.id,
+            device_name: device.device_name || 'Unknown',
+            device_type: device.device_type,
+            status: 'success'
+          });
+          
+          successCount++;
+          console.log(`[TASK-NOTIF] ✅ Sent to ${device.device_name || 'device'}`);
+        }
+
+      } catch (deviceError) {
+        results.push({
+          device_id: device.id,
+          device_name: device.device_name || 'Unknown',
+          device_type: device.device_type,
+          status: 'error',
+          reason: deviceError.message
+        });
+        
+        failedCount++;
+        console.error(`[TASK-NOTIF] ❌ Failed to send to device ${device.device_name || device.id}:`, deviceError.message);
+      }
+    }
+
+    console.log(`[TASK-NOTIF] 📊 Results: ${successCount} success, ${failedCount} failed out of ${devicesResult.rows.length} devices`);
+
+    res.json({
+      success: successCount > 0,  // Success if at least one device got the notification
+      message: `Notification sent to ${successCount} of ${devicesResult.rows.length} device(s)`,
+      user_info: {
+        internal_user_id: internal_user_id,
+        username: user.username,
+        full_name: user.full_name
+      },
+      task_info: {
+        task_internal_id: task_internal_id,
+        task_name: taskName
+      },
+      summary: {
+        total_devices: devicesResult.rows.length,
+        success_count: successCount,
+        failed_count: failedCount
+      },
+      devices: results
+    });
+
+  } catch (error) {
+    console.error('[TASK-NOTIF] ❌ Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to send notification',
+      message: error.message 
+    });
+  }
+});
+
+
 module.exports = router;
