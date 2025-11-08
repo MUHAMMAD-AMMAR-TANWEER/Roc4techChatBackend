@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const odooSessionManager = require('../services/odooSession');
 
 // Simple session storage (in production, use Redis or database)
 const sessions = new Map();
@@ -704,6 +705,7 @@ router.get('/broadcast/panel', (req, res) => {
 });
 
 // Send broadcast API (protected)
+// Send broadcast API (protected)
 router.post('/broadcast/send', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
@@ -721,7 +723,7 @@ router.post('/broadcast/send', async (req, res) => {
 
     // Build query based on filter
     let query = `
-      SELECT DISTINCT ud.id, ud.fcm_token, ud.device_name, ud.device_type, 
+      SELECT DISTINCT ud.id, ud.fcm_token, ud.device_id, ud.device_name, ud.device_type,
              u.id as user_id, u.username, u.full_name, u.user_type
       FROM user_devices ud
       JOIN users u ON ud.user_id = u.id
@@ -786,6 +788,90 @@ router.post('/broadcast/send', async (req, res) => {
 
     console.log(`📢 [BROADCAST] Complete: ${successCount} success, ${failedCount} failed`);
 
+    // ========== 🆕 SAVE NOTIFICATIONS TO DATABASE ==========
+    try {
+      console.log(`📢 [BROADCAST] Saving notifications to database for ${devicesResult.rows.length} devices...`);
+
+      // Insert notifications for each device that successfully received notification
+      const notificationInserts = [];
+      for (const device of devicesResult.rows) {
+        // Get user's internal_id
+        const userQuery = await pool.query(
+          'SELECT internal_user_id FROM users WHERE id = $1',
+          [device.user_id]
+        );
+
+        if (userQuery.rows.length > 0) {
+          const internalId = userQuery.rows[0].internal_user_id;
+
+          notificationInserts.push(pool.query(
+            `INSERT INTO user_notifications
+            (user_id, internal_id, title, body, type, message_type, internal_task_id, fcm_token, device_id, watched)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+            [device.user_id, internalId, title, body, 'broadcast', 'admin_broadcast', null, device.fcm_token, device.device_id]
+          ));
+        }
+      }
+
+      await Promise.all(notificationInserts);
+      console.log(`📢 [BROADCAST] ✅ Saved ${notificationInserts.length} notifications to database`);
+
+    } catch (dbError) {
+      console.error('[BROADCAST] ❌ Failed to save notifications to database:', dbError.message);
+    }
+
+    // ========== 🆕 SEND NOTIFICATION TO ODOO USING SESSION MANAGER ==========
+    let odooNotificationSent = false;
+    try {
+      const odooPayload = {
+        title: title,
+        message: `
+          <div style="padding: 10px; background: #f8f9fa; border-radius: 5px;">
+            <p><strong>📱 Broadcast Notification Sent via Chat System</strong></p>
+            <hr style="margin: 10px 0;">
+            <p><strong>Title:</strong> ${title}</p>
+            <p><strong>Message:</strong> ${body}</p>
+            <hr style="margin: 10px 0;">
+            <p><strong>📊 Delivery Statistics:</strong></p>
+            <ul>
+              <li>Total Devices: ${devicesResult.rows.length}</li>
+              <li>Unique Users: ${uniqueUsers.size}</li>
+              <li>Successfully Delivered: ${successCount}</li>
+              <li>Failed: ${failedCount}</li>
+              <li>Filter Applied: ${user_type_filter || 'All Users'}</li>
+            </ul>
+            <p style="margin-top: 10px; font-size: 12px; color: #666;">
+              Sent at: ${new Date().toLocaleString()}
+            </p>
+          </div>
+        `,
+        priority: 'high',
+        sender_name: 'Chat Broadcast System'
+      };
+
+      console.log('[BROADCAST→ODOO] 📤 Sending notification to Odoo...');
+      
+      // Use the session manager to call Odoo API
+      const odooResponse = await odooSessionManager.callOdooAPI(
+        '/api/project/notifications/broadcast',
+        odooPayload
+      );
+
+      // Handle JSON-RPC response format
+      const result = odooResponse.result || odooResponse;
+      
+      if (result && result.success) {
+        console.log('[BROADCAST→ODOO] ✅ Odoo notification sent successfully');
+        odooNotificationSent = true;
+      } else {
+        console.log('[BROADCAST→ODOO] ⚠️ Odoo responded but notification may have failed:', result);
+      }
+
+    } catch (odooError) {
+      // Don't fail the broadcast if Odoo notification fails
+      console.error('[BROADCAST→ODOO] ❌ Failed to notify Odoo:', odooError.message);
+    }
+
     res.json({
       success: successCount > 0,
       message: 'Broadcast sent successfully',
@@ -797,7 +883,8 @@ router.post('/broadcast/send', async (req, res) => {
         filter_applied: user_type_filter || 'all users'
       },
       broadcast_content: { title, body },
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      odoo_notified: odooNotificationSent
     });
 
   } catch (error) {
@@ -808,5 +895,485 @@ router.post('/broadcast/send', async (req, res) => {
     });
   }
 });
+
+// ========== SERVER-TO-SERVER BROADCAST API (No Bearer Token Required) ==========
+// Protected by API Key instead of session token
+router.post('/broadcast/send-internal', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log('\n========================================');
+  console.log(`🔔 [INTERNAL-BROADCAST] API Called at ${requestTimestamp}`);
+  console.log('========================================');
+  console.log(`📍 Endpoint: POST /admin/broadcast/send-internal`);
+  console.log(`🌐 Request IP: ${req.ip || req.socket?.remoteAddress || 'unknown'}`);
+  console.log(`📦 Request Body:`, JSON.stringify({
+    title: req.body.title,
+    body: req.body.body,
+    user_type_filter: req.body.user_type_filter || 'all users'
+  }, null, 2));
+
+  try {
+    // Check API key from header or body
+    const apiKey = req.headers['x-api-key'] || req.body.api_key;
+    const INTERNAL_API_KEY = process.env.INTERNAL_BROADCAST_API_KEY || 'default-internal-key-change-me';
+
+    console.log(`🔑 API Key Authentication: ${apiKey ? 'Key Provided' : 'No Key Provided'}`);
+
+    if (!apiKey || apiKey !== INTERNAL_API_KEY) {
+      console.log('❌ [INTERNAL-BROADCAST] Authentication Failed - Invalid or missing API key');
+      console.log('========================================\n');
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid or missing API key'
+      });
+    }
+
+    console.log('✅ [INTERNAL-BROADCAST] Authentication Successful');
+
+    const { title, body, user_type_filter } = req.body;
+    const pool = req.app.locals.pool;
+
+    if (!title || !body) {
+      console.log('❌ [INTERNAL-BROADCAST] Validation Failed - Missing title or body');
+      console.log('========================================\n');
+      return res.status(400).json({ error: 'title and body are required' });
+    }
+
+    console.log('✅ [INTERNAL-BROADCAST] Request Validated');
+
+    // Build query based on filter
+    let query = `
+      SELECT DISTINCT ud.id, ud.fcm_token, ud.device_id, ud.device_name, ud.device_type,
+             u.id as user_id, u.username, u.full_name, u.user_type
+      FROM user_devices ud
+      JOIN users u ON ud.user_id = u.id
+      WHERE ud.is_active = true AND ud.fcm_token IS NOT NULL
+    `;
+
+    const params = [];
+    if (user_type_filter) {
+      params.push(user_type_filter);
+      query += ` AND u.user_type = $1`;
+      console.log(`🔍 [INTERNAL-BROADCAST] Applying filter: user_type = '${user_type_filter}'`);
+    } else {
+      console.log(`🔍 [INTERNAL-BROADCAST] No filter applied - targeting all users`);
+    }
+
+    console.log('📊 [INTERNAL-BROADCAST] Querying database for active devices...');
+    const devicesResult = await pool.query(query, params);
+
+    if (devicesResult.rows.length === 0) {
+      console.log('⚠️ [INTERNAL-BROADCAST] No active devices found');
+      console.log('========================================\n');
+      return res.status(404).json({
+        error: 'No active devices found',
+        filter_applied: user_type_filter || 'none'
+      });
+    }
+
+    console.log(`📢 [INTERNAL-BROADCAST] Found ${devicesResult.rows.length} active devices`);
+    console.log(`👥 [INTERNAL-BROADCAST] Starting push notification delivery...`);
+
+    const { sendPushNotification } = require('../services/pushNotification');
+
+    let successCount = 0;
+    let failedCount = 0;
+    const uniqueUsers = new Set();
+
+    // Send to all devices
+    for (const device of devicesResult.rows) {
+      uniqueUsers.add(device.user_id);
+
+      try {
+        const data = {
+          type: 'broadcast_technician_notify',
+          timestamp: new Date().toISOString()
+
+        };
+
+        const pushResult = await sendPushNotification(
+          device.fcm_token,
+          title,
+          body,
+          data
+        );
+
+        if (pushResult && pushResult.shouldRemoveToken) {
+          await pool.query(
+            'UPDATE user_devices SET is_active = false WHERE id = $1',
+            [device.id]
+          );
+          failedCount++;
+        } else {
+          successCount++;
+        }
+
+      } catch (error) {
+        failedCount++;
+        console.error(`[INTERNAL-BROADCAST] Error sending to ${device.username}:`, error.message);
+      }
+    }
+
+    console.log(`📢 [INTERNAL-BROADCAST] Push Notification Delivery Complete:`);
+    console.log(`   ✅ Success: ${successCount}`);
+    console.log(`   ❌ Failed: ${failedCount}`);
+    console.log(`   👤 Unique Users: ${uniqueUsers.size}`);
+
+    // Save notifications to database
+    try {
+      console.log(`💾 [INTERNAL-BROADCAST] Saving notifications to database for ${devicesResult.rows.length} devices...`);
+
+      const notificationInserts = [];
+      for (const device of devicesResult.rows) {
+        const userQuery = await pool.query(
+          'SELECT internal_user_id FROM users WHERE id = $1',
+          [device.user_id]
+        );
+
+        if (userQuery.rows.length > 0) {
+          const internalId = userQuery.rows[0].internal_user_id;
+
+          notificationInserts.push(pool.query(
+            `INSERT INTO user_notifications
+            (user_id, internal_id, title, body, type, message_type, internal_task_id, fcm_token, device_id, watched)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+            [device.user_id, internalId, title, body, 'broadcast', 'broadcast_internal', null, device.fcm_token, device.device_id]
+          ));
+        }
+      }
+
+      await Promise.all(notificationInserts);
+      console.log(`💾 [INTERNAL-BROADCAST] ✅ Saved ${notificationInserts.length} notifications to database`);
+
+    } catch (dbError) {
+      console.error('💾 [INTERNAL-BROADCAST] ❌ Failed to save notifications to database:', dbError.message);
+    }
+
+    // Send notification to Odoo
+    let odooNotificationSent = false;
+    try {
+      console.log('🔗 [INTERNAL-BROADCAST→ODOO] Preparing to send notification to Odoo...');
+      const odooPayload = {
+        title: title,
+        message: `
+          <div style="padding: 10px; background: #f8f9fa; border-radius: 5px;">
+            <p><strong>📱 Broadcast Notification Sent via Chat System</strong></p>
+            <hr style="margin: 10px 0;">
+            <p><strong>Title:</strong> ${title}</p>
+            <p><strong>Message:</strong> ${body}</p>
+            <hr style="margin: 10px 0;">
+            <p><strong>📊 Delivery Statistics:</strong></p>
+            <ul>
+              <li>Total Devices: ${devicesResult.rows.length}</li>
+              <li>Unique Users: ${uniqueUsers.size}</li>
+              <li>Successfully Delivered: ${successCount}</li>
+              <li>Failed: ${failedCount}</li>
+              <li>Filter Applied: ${user_type_filter || 'All Users'}</li>
+            </ul>
+            <p style="margin-top: 10px; font-size: 12px; color: #666;">
+              Sent at: ${new Date().toLocaleString()}
+            </p>
+          </div>
+        `,
+        priority: 'high',
+        sender_name: 'Chat Broadcast System'
+      };
+
+      console.log('🔗 [INTERNAL-BROADCAST→ODOO] Sending notification to Odoo API...');
+
+      const odooResponse = await odooSessionManager.callOdooAPI(
+        '/api/project/notifications/broadcast',
+        odooPayload
+      );
+
+      const result = odooResponse.result || odooResponse;
+
+      if (result && result.success) {
+        console.log('🔗 [INTERNAL-BROADCAST→ODOO] ✅ Odoo notification sent successfully');
+        odooNotificationSent = true;
+      } else {
+        console.log('🔗 [INTERNAL-BROADCAST→ODOO] ⚠️ Odoo responded but notification may have failed:', JSON.stringify(result));
+      }
+
+    } catch (odooError) {
+      console.error('🔗 [INTERNAL-BROADCAST→ODOO] ❌ Failed to notify Odoo:', odooError.message);
+    }
+
+    const responseData = {
+      success: successCount > 0,
+      message: 'Broadcast sent successfully',
+      summary: {
+        total_devices: devicesResult.rows.length,
+        unique_users: uniqueUsers.size,
+        success_count: successCount,
+        failed_count: failedCount,
+        filter_applied: user_type_filter || 'all users'
+      },
+      broadcast_content: { title, body },
+      timestamp: new Date().toISOString(),
+      odoo_notified: odooNotificationSent
+    };
+
+    console.log('✅ [INTERNAL-BROADCAST] Request completed successfully');
+    console.log('📊 [INTERNAL-BROADCAST] Response Summary:', JSON.stringify(responseData.summary, null, 2));
+    console.log('========================================\n');
+
+    res.json(responseData);
+
+  } catch (error) {
+    console.error('❌ [INTERNAL-BROADCAST] Error occurred:', error.message);
+    console.error('❌ [INTERNAL-BROADCAST] Stack trace:', error.stack);
+    console.log('========================================\n');
+    res.status(500).json({
+      error: 'Failed to send broadcast',
+      message: error.message
+    });
+  }
+});
+
+// ========== TARGETED BROADCAST BY INTERNAL IDs (Server-to-Server) ==========
+// Broadcast to specific users by their internal_ids
+router.post('/broadcast/send-to-users', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log('\n========================================');
+  console.log(`🎯 [TARGETED-BROADCAST] API Called at ${requestTimestamp}`);
+  console.log('========================================');
+  console.log(`📍 Endpoint: POST /admin/broadcast/send-to-users`);
+  console.log(`🌐 Request IP: ${req.ip || req.socket?.remoteAddress || 'unknown'}`);
+
+  try {
+    // Check API key from header or body
+    const apiKey = req.headers['x-api-key'] || req.body.api_key;
+    const INTERNAL_API_KEY = process.env.INTERNAL_BROADCAST_API_KEY || 'default-internal-key-change-me';
+
+    console.log(`🔑 API Key Authentication: ${apiKey ? 'Key Provided' : 'No Key Provided'}`);
+
+    if (!apiKey || apiKey !== INTERNAL_API_KEY) {
+      console.log('❌ [TARGETED-BROADCAST] Authentication Failed - Invalid or missing API key');
+      console.log('========================================\n');
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid or missing API key'
+      });
+    }
+
+    console.log('✅ [TARGETED-BROADCAST] Authentication Successful');
+
+    const { internal_ids, title, body, message_type, internal_task_id } = req.body;
+    const pool = req.app.locals.pool;
+
+    console.log(`📦 Request Body:`, JSON.stringify({
+      internal_ids: internal_ids,
+      title: title,
+      body: body,
+      message_type: message_type || 'notification'
+    }, null, 2));
+
+    // Validation
+    if (!internal_ids || !Array.isArray(internal_ids) || internal_ids.length === 0) {
+      console.log('❌ [TARGETED-BROADCAST] Validation Failed - internal_ids must be a non-empty array');
+      console.log('========================================\n');
+      return res.status(400).json({
+        error: 'internal_ids is required and must be a non-empty array'
+      });
+    }
+
+    if (!title || !body) {
+      console.log('❌ [TARGETED-BROADCAST] Validation Failed - Missing title or body');
+      console.log('========================================\n');
+      return res.status(400).json({ error: 'title and body are required' });
+    }
+
+    console.log('✅ [TARGETED-BROADCAST] Request Validated');
+    console.log(`🎯 [TARGETED-BROADCAST] Targeting ${internal_ids.length} internal_id(s): ${internal_ids.join(', ')}`);
+
+    // Query to get all devices for users with specified internal_ids
+    const query = `
+      SELECT DISTINCT ud.id, ud.fcm_token, ud.device_id, ud.device_name, ud.device_type,
+             u.id as user_id, u.username, u.full_name, u.user_type, u.internal_user_id
+      FROM user_devices ud
+      JOIN users u ON ud.user_id = u.id
+      WHERE ud.is_active = true
+        AND ud.fcm_token IS NOT NULL
+        AND u.internal_user_id = ANY($1)
+    `;
+
+    console.log('📊 [TARGETED-BROADCAST] Querying database for active devices...');
+    const devicesResult = await pool.query(query, [internal_ids]);
+
+    if (devicesResult.rows.length === 0) {
+      console.log('⚠️ [TARGETED-BROADCAST] No active devices found for given internal_ids');
+      console.log('========================================\n');
+      return res.status(404).json({
+        error: 'No active devices found for the specified internal_ids',
+        internal_ids_searched: internal_ids
+      });
+    }
+
+    console.log(`📢 [TARGETED-BROADCAST] Found ${devicesResult.rows.length} active devices for ${new Set(devicesResult.rows.map(d => d.internal_user_id)).size} users`);
+    console.log(`👥 [TARGETED-BROADCAST] Starting push notification delivery...`);
+
+    const { sendPushNotification } = require('../services/pushNotification');
+
+    let successCount = 0;
+    let failedCount = 0;
+    const uniqueUsers = new Set();
+    const targetedInternalIds = new Set();
+
+    // Send to all devices
+    for (const device of devicesResult.rows) {
+      uniqueUsers.add(device.user_id);
+      targetedInternalIds.add(device.internal_user_id);
+
+      try {
+        const data = {
+          type: message_type || 'notification',
+          timestamp: new Date().toISOString(),
+          internal_id: device.internal_user_id
+        };
+
+        const pushResult = await sendPushNotification(
+          device.fcm_token,
+          title,
+          body,
+          data
+        );
+
+        if (pushResult && pushResult.shouldRemoveToken) {
+          await pool.query(
+            'UPDATE user_devices SET is_active = false WHERE id = $1',
+            [device.id]
+          );
+          failedCount++;
+        } else {
+          successCount++;
+        }
+
+      } catch (error) {
+        failedCount++;
+        console.error(`[TARGETED-BROADCAST] Error sending to ${device.username}:`, error.message);
+      }
+    }
+
+    console.log(`📢 [TARGETED-BROADCAST] Push Notification Delivery Complete:`);
+    console.log(`   ✅ Success: ${successCount}`);
+    console.log(`   ❌ Failed: ${failedCount}`);
+    console.log(`   👤 Unique Users: ${uniqueUsers.size}`);
+    console.log(`   🎯 Internal IDs Reached: ${Array.from(targetedInternalIds).join(', ')}`);
+
+    // Save notifications to database
+    try {
+      console.log(`💾 [TARGETED-BROADCAST] Saving notifications to database for ${devicesResult.rows.length} devices...`);
+
+      const notificationInserts = [];
+      for (const device of devicesResult.rows) {
+        const userQuery = await pool.query(
+          'SELECT internal_user_id FROM users WHERE id = $1',
+          [device.user_id]
+        );
+
+        if (userQuery.rows.length > 0) {
+          const internalId = userQuery.rows[0].internal_user_id;
+
+          notificationInserts.push(pool.query(
+            `INSERT INTO user_notifications
+            (user_id, internal_id, title, body, type, message_type, internal_task_id, fcm_token, device_id, watched)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+            [device.user_id, internalId, title, body, message_type || 'notification', 'targeted_broadcast', internal_task_id || null, device.fcm_token, device.device_id]
+          ));
+        }
+      }
+
+      await Promise.all(notificationInserts);
+      console.log(`💾 [TARGETED-BROADCAST] ✅ Saved ${notificationInserts.length} notifications to database`);
+
+    } catch (dbError) {
+      console.error('💾 [TARGETED-BROADCAST] ❌ Failed to save notifications to database:', dbError.message);
+    }
+
+    // Send notification to Odoo
+    let odooNotificationSent = false;
+    try {
+      console.log('🔗 [TARGETED-BROADCAST→ODOO] Preparing to send notification to Odoo...');
+      const odooPayload = {
+        title: title,
+        message: `
+          <div style="padding: 10px; background: #f8f9fa; border-radius: 5px;">
+            <p><strong>🎯 Targeted Broadcast Notification Sent via Chat System</strong></p>
+            <hr style="margin: 10px 0;">
+            <p><strong>Title:</strong> ${title}</p>
+            <p><strong>Message:</strong> ${body}</p>
+            <p><strong>Message Type:</strong> ${message_type || 'notification'}</p>
+            <hr style="margin: 10px 0;">
+            <p><strong>📊 Delivery Statistics:</strong></p>
+            <ul>
+              <li>Total Devices: ${devicesResult.rows.length}</li>
+              <li>Unique Users: ${uniqueUsers.size}</li>
+              <li>Successfully Delivered: ${successCount}</li>
+              <li>Failed: ${failedCount}</li>
+              <li>Targeted Internal IDs: ${Array.from(targetedInternalIds).join(', ')}</li>
+            </ul>
+            <p style="margin-top: 10px; font-size: 12px; color: #666;">
+              Sent at: ${new Date().toLocaleString()}
+            </p>
+          </div>
+        `,
+        priority: 'high',
+        sender_name: 'Chat Broadcast System'
+      };
+
+      console.log('🔗 [TARGETED-BROADCAST→ODOO] Sending notification to Odoo API...');
+
+      const odooResponse = await odooSessionManager.callOdooAPI(
+        '/api/project/notifications/broadcast',
+        odooPayload
+      );
+
+      const result = odooResponse.result || odooResponse;
+
+      if (result && result.success) {
+        console.log('🔗 [TARGETED-BROADCAST→ODOO] ✅ Odoo notification sent successfully');
+        odooNotificationSent = true;
+      } else {
+        console.log('🔗 [TARGETED-BROADCAST→ODOO] ⚠️ Odoo responded but notification may have failed:', JSON.stringify(result));
+      }
+
+    } catch (odooError) {
+      console.error('🔗 [TARGETED-BROADCAST→ODOO] ❌ Failed to notify Odoo:', odooError.message);
+    }
+
+    const responseData = {
+      success: successCount > 0,
+      message: 'Targeted broadcast sent successfully',
+      summary: {
+        total_devices: devicesResult.rows.length,
+        unique_users: uniqueUsers.size,
+        success_count: successCount,
+        failed_count: failedCount,
+        targeted_internal_ids: Array.from(targetedInternalIds),
+        requested_internal_ids: internal_ids,
+        message_type: message_type || 'notification'
+      },
+      broadcast_content: { title, body },
+      timestamp: new Date().toISOString(),
+      odoo_notified: odooNotificationSent
+    };
+
+    console.log('✅ [TARGETED-BROADCAST] Request completed successfully');
+    console.log('📊 [TARGETED-BROADCAST] Response Summary:', JSON.stringify(responseData.summary, null, 2));
+    console.log('========================================\n');
+
+    res.json(responseData);
+
+  } catch (error) {
+    console.error('❌ [TARGETED-BROADCAST] Error occurred:', error.message);
+    console.error('❌ [TARGETED-BROADCAST] Stack trace:', error.stack);
+    console.log('========================================\n');
+    res.status(500).json({
+      error: 'Failed to send targeted broadcast',
+      message: error.message
+    });
+  }
+});
+
 
 module.exports = router;

@@ -1035,7 +1035,7 @@ router.post('/fcm/send-task-notification', async (req, res) => {
             'UPDATE user_devices SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
             [device.id]
           );
-          
+
           results.push({
             device_id: device.id,
             device_name: device.device_name || 'Unknown',
@@ -1043,19 +1043,47 @@ router.post('/fcm/send-task-notification', async (req, res) => {
             status: 'failed',
             reason: 'Invalid FCM token - device marked as inactive'
           });
-          
+
           failedCount++;
           console.log(`[TASK-NOTIF] 🗑️ Marked device ${device.device_name || device.id} as inactive`);
         } else {
+          // Save notification to user_notifications table
+          await pool.query(`
+            INSERT INTO user_notifications (
+              user_id,
+              internal_id,
+              title,
+              body,
+              type,
+              message_type,
+              internal_task_id,
+              fcm_token,
+              device_id,
+              watched,
+              created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+          `, [
+            user.id,
+            internal_user_id,
+            title,
+            body,
+            'task_notification',
+            'task_notification',      // message_type for mobile routing
+            task_internal_id,         // internal_task_id for task details navigation
+            device.fcm_token,
+            device.device_id,
+            false
+          ]);
+
           results.push({
             device_id: device.id,
             device_name: device.device_name || 'Unknown',
             device_type: device.device_type,
             status: 'success'
           });
-          
+
           successCount++;
-          console.log(`[TASK-NOTIF] ✅ Sent to ${device.device_name || 'device'}`);
+          console.log(`[TASK-NOTIF] ✅ Sent to ${device.device_name || 'device'} and saved to notifications table`);
         }
 
       } catch (deviceError) {
@@ -1066,7 +1094,7 @@ router.post('/fcm/send-task-notification', async (req, res) => {
           status: 'error',
           reason: deviceError.message
         });
-        
+
         failedCount++;
         console.error(`[TASK-NOTIF] ❌ Failed to send to device ${device.device_name || device.id}:`, deviceError.message);
       }
