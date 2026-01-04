@@ -82,8 +82,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Make pool available to routes
+// Make pool and io available to routes
 app.locals.pool = pool;
+app.locals.io = io;
 
 // API Routes
 app.use('/api/users', require('./routes/users'));

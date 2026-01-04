@@ -612,23 +612,23 @@ if (accessCheck.rows.length === 0) {
     socket.on('mark_messages_read', async (data) => {
       try {
         const { roomId, messageIds } = data;
-        
+
         if (!roomId) {
           return socket.emit('error', { message: 'Room ID is required' });
         }
 
         // Verify access to room
         const accessCheck = await pool.query(`
-  SELECT cr.id 
+  SELECT cr.id
   FROM chat_rooms cr
-  WHERE cr.id = $1 
+  WHERE cr.id = $1
   AND (
-    cr.client_id = $2 
-    OR cr.technician_id = $2 
+    cr.client_id = $2
+    OR cr.technician_id = $2
     OR EXISTS (
-      SELECT 1 FROM room_participants rp 
-      WHERE rp.room_id = cr.id 
-      AND rp.user_id = $2 
+      SELECT 1 FROM room_participants rp
+      WHERE rp.room_id = cr.id
+      AND rp.user_id = $2
       AND rp.is_active = true
     )
   )
@@ -638,44 +638,46 @@ if (accessCheck.rows.length === 0) {
           return socket.emit('error', { message: 'Access denied to this room' });
         }
 
-        if (messageIds && Array.isArray(messageIds)) {
-          // Mark specific messages as read
-          const placeholders = messageIds.map((_, index) => `${index + 3}`).join(',');
-          
-          await pool.query(`
-            INSERT INTO message_reads (message_id, user_id)
-            SELECT id, $2 FROM messages 
-            WHERE room_id = $1 AND id IN (${placeholders}) AND sender_id != $2
-            ON CONFLICT (message_id, user_id) DO NOTHING
-          `, [roomId, socket.userId, ...messageIds]);
+        // 🔧 FIX: Use per-user read tracking (message_reads table)
+        // Do NOT update the global is_read flag - use message_reads for per-user tracking
+        try {
+          if (messageIds && Array.isArray(messageIds) && messageIds.length > 0) {
+            // Mark specific messages as read for THIS user only
+            const placeholders = messageIds.map((_, index) => `$${index + 3}`).join(',');
 
-          await pool.query(`
-            UPDATE messages 
-            SET is_read = true 
-            WHERE room_id = $1 AND id IN (${placeholders}) AND sender_id != $2
-          `, [roomId, socket.userId, ...messageIds]);
-        } else {
-          // Mark all unread messages as read
-          await pool.query(`
-            INSERT INTO message_reads (message_id, user_id)
-            SELECT id, $2 FROM messages 
-            WHERE room_id = $1 AND sender_id != $2 AND is_read = false
-            ON CONFLICT (message_id, user_id) DO NOTHING
-          `, [roomId, socket.userId]);
+            await pool.query(`
+              INSERT INTO message_reads (message_id, user_id)
+              SELECT id, $2 FROM messages
+              WHERE room_id = $1 AND id IN (${placeholders}) AND sender_id != $2
+              ON CONFLICT (message_id, user_id) DO NOTHING
+            `, [roomId, socket.userId, ...messageIds]);
 
-          await pool.query(
-            'UPDATE messages SET is_read = true WHERE room_id = $1 AND sender_id != $2',
-            [roomId, socket.userId]
-          );
+          } else {
+            // Mark all unread messages as read for THIS user only
+            await pool.query(`
+              INSERT INTO message_reads (message_id, user_id)
+              SELECT id, $2 FROM messages
+              WHERE room_id = $1 AND sender_id != $2
+              AND NOT EXISTS (
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = messages.id
+                AND mr.user_id = $2
+              )
+              ON CONFLICT (message_id, user_id) DO NOTHING
+            `, [roomId, socket.userId]);
+          }
+        } catch (err) {
+          console.error('[MARK_READ] Error:', err);
+          throw err;
         }
-        
+
         // Broadcast read status to room
         socket.to(`room_${roomId}`).emit('messages_read', {
           userId: socket.userId,
           username: socket.user.username,
           messageIds: messageIds
         });
-        
+
       } catch (error) {
         console.error('Error marking messages as read:', error);
         socket.emit('error', { message: 'Failed to mark messages as read' });
