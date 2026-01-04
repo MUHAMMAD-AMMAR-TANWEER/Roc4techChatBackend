@@ -28,7 +28,7 @@ async function createOdooSession() {
       {
         jsonrpc: "2.0",
         params: {
-          db: "Mobile_api",
+          db: "Roc4_Production",
           login: "merac",
           password: "123"
         }

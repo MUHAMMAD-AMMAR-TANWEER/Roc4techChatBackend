@@ -4,7 +4,7 @@ class OdooSessionManager {
   constructor() {
     this.session = null;
     this.baseUrl = process.env.ODOO_BASE_URL || 'http://127.0.0.1:8069';
-    this.db = process.env.ODOO_DB || 'Mobile_api';
+    this.db = process.env.ODOO_DB || 'Roc4_Production';
     this.login = process.env.ODOO_LOGIN || 'merac';
     this.password = process.env.ODOO_PASSWORD || '123';
     this.sessionRefreshInterval = null;

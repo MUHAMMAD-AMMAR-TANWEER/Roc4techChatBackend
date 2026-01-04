@@ -2,7 +2,7 @@ const axios = require('axios');
 const https = require('https');
 
 // --- Configuration ---
-const API_URL = 'http://127.0.0.1:8069/web/database/mobile_api/api/chat/sync_message'; 
+const API_URL = 'http://127.0.0.1:8069/web/database/roc4_production/api/chat/sync_message'; 
 const PAYLOAD = {
     message_id: 305,
     internal_task_id: 343,
@@ -38,7 +38,7 @@ async function syncMessageTest() {
     headers: { 
       'Content-Type': 'application/json',
       'X-Openerp-Session-Id': 'session_id',  // ✅ Add this
-      'Cookie': 'session_id=; db=mobile_api'  // ✅ Or this
+      'Cookie': 'session_id=; db=roc4_production'  // ✅ Or this
     },
     timeout: 10000
   }
